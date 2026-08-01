@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import re
 from nltk.corpus import stopwords
 import nltk
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
 import json 
 import scipy.stats as stats 
 

@@ -1,0 +1,1964 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+import bcrypt 
+import numpy as np 
+import plotly.express as px
+from datetime import datetime
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+import re
+from nltk.corpus import stopwords
+import nltk
+import json 
+import scipy.stats as stats 
+
+# Asegurar que nltk tenga las stopwords
+try:
+    nltk.data.find('corpora/stopwords')
+except nltk.downloader.DownloadError:
+    nltk.download('stopwords')
+
+# --- 1. CONFIGURACIÓN E INICIALIZACIÓN DE LA APLICACIÓN ---
+
+# Configuración de la página de StreamlitF
+st.set_page_config(
+    page_title="Gestión de Estudios de Mercado",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+# --- ESTILOS CSS PARA QUITAR RECUADROS DE CONTENEDORES ---
+st.markdown("""
+    <style>
+    div[data-testid="stVerticalBlock"], div[data-testid="stHorizontalBlock"], div[data-testid="stContainer"] {
+        background-color: transparent !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+# Inicializar el Estado de Sesión
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'current_view' not in st.session_state:
+    st.session_state['current_view'] = 'home'
+if 'username' not in st.session_state:
+    st.session_state['username'] = None
+# Inicializar el estado del tema
+if 'theme' not in st.session_state:
+    st.session_state['theme'] = 'Dark' # Tema inicial por defecto
+
+# Inicializar estados para Codificación
+if 'coding_codes' not in st.session_state:
+    st.session_state['coding_codes'] = []
+if 'coding_var_abierta' not in st.session_state:
+    st.session_state['coding_var_abierta'] = None
+
+# Variable para almacenar el DataFrame del estudio seleccionado
+if 'selected_df' not in st.session_state:
+    st.session_state['selected_df'] = None
+
+# --- 2. GESTIÓN DE BASE DE DATOS (SQLite) ---
+
+DB_NAME = 'estudios_db.db'
+
+def init_db():
+    """Inicializa la base de datos de usuarios, estudios y paneles."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Tabla de Usuarios
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT,
+            nombre_completo TEXT,
+            correo TEXT
+        )
+    ''')
+    # Tabla de Estudios
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS estudios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            titulo TEXT NOT NULL,
+            fecha_inicio TEXT,
+            fecha_fin TEXT,
+            empresa TEXT,
+            muestra INTEGER,
+            tecnica TEXT,
+            estado TEXT,
+            cuotas_json TEXT, 
+            link_cuestionario TEXT
+        )
+    ''')
+    
+    # Tabla de Cuestionarios
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS cuestionarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            estudio_id INTEGER NOT NULL,
+            pregunta_texto TEXT NOT NULL,
+            columna_csv TEXT,
+            tipo_pregunta TEXT,
+            FOREIGN KEY (estudio_id) REFERENCES estudios (id)
+        )
+    ''')
+        
+    # Tabla de Encuestados/Paneles
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS paneles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id_externo TEXT UNIQUE NOT NULL,
+            nombre TEXT,
+            comuna TEXT,
+            edad INTEGER,
+            genero TEXT,
+            fecha_registro TEXT
+        )
+    ''')
+    
+    # MODIFICACIÓN DE ESQUEMA: Añadir link_cuestionario si no existe 
+    try:
+        c.execute("ALTER TABLE estudios ADD COLUMN link_cuestionario TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_db_connection():
+    """Función auxiliar para obtener la conexión a la DB."""
+    return sqlite3.connect(DB_NAME)
+
+# Funciones de Usuarios (Creación y Verificación)
+def create_user(username, password, nombre, correo):
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO users (username, password_hash, nombre_completo, correo) VALUES (?, ?, ?, ?)",
+                  (username, hashed_password.decode('utf-8'), nombre, correo))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def verify_user(username, password):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        password_hash = result[0].encode('utf-8')
+        return bcrypt.checkpw(password.encode('utf-8'), password_hash)
+    return False
+
+# Funciones de Estudios (Guardar, Cargar y Eliminar)
+
+def save_estudio(titulo, inicio, fin, empresa, muestra, tecnica, cuotas_json, link_cuestionario):
+    """Guarda un nuevo estudio en la tabla de estudios, incluyendo cuotas y link del cuestionario."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    # Estado inicial: Creación de Estudio
+    c.execute("INSERT INTO estudios (titulo, fecha_inicio, fecha_fin, empresa, muestra, tecnica, estado, cuotas_json, link_cuestionario) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              (titulo, str(inicio), str(fin), empresa, muestra, tecnica, 'Creación de Estudio', cuotas_json, link_cuestionario)) 
+    conn.commit()
+    estudio_id = c.lastrowid
+    conn.close()
+    return estudio_id
+
+def delete_estudio(estudio_id):
+    """Elimina un estudio y sus preguntas asociadas."""
+    conn = get_db_connection()
+    c = conn.cursor()
+
+       
+@st.cache_data
+def get_all_estudios():
+    """Recupera todos los estudios guardados en la DB y los formatea."""
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT id, titulo, fecha_inicio, estado, tecnica, muestra, cuotas_json, link_cuestionario FROM estudios ORDER BY id DESC", conn)
+    conn.close()
+    
+    df.columns = ['ID', 'Título', 'Fecha', 'Estado', 'Monitor', 'Muestra', 'Cuotas_JSON', 'Link_Cuestionario']
+    df['Análisis'] = 'Ver' 
+    return df
+
+@st.cache_data
+def get_estudio_details(estudio_id):
+    """Recupera los detalles completos de un estudio por su ID."""
+    conn = get_db_connection()
+    df_estudio = pd.read_sql_query("SELECT * FROM estudios WHERE id = ?", conn, params=(estudio_id,))
+    conn.close()
+    if df_estudio.empty:
+        return None
+    return df_estudio.iloc[0].to_dict()
+
+def update_estudio_state(estudio_id, new_state):
+    """Actualiza el estado de un estudio."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("UPDATE estudios SET estado = ? WHERE id = ?", (new_state, estudio_id))
+        conn.commit()
+        st.cache_data.clear()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+# --- NUEVAS FUNCIONES DE CUESTIONARIOS ---
+def save_questions(estudio_id, questions_list):
+    """Guarda una lista de preguntas para un estudio, mapeando el texto a la columna CSV."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    # Limpiar preguntas existentes para ese estudio (para permitir reguardar)
+    c.execute("DELETE FROM cuestionarios WHERE estudio_id = ?", (estudio_id,))
+    
+    for q in questions_list:
+        c.execute("INSERT INTO cuestionarios (estudio_id, pregunta_texto, columna_csv, tipo_pregunta) VALUES (?, ?, ?, ?)",
+                  (estudio_id, q['texto'], q['columna'], q['tipo']))
+    conn.commit()
+    conn.close()
+
+@st.cache_data
+def get_questions_by_study(estudio_id):
+    """Recupera la lista de preguntas definidas para un estudio."""
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT pregunta_texto, columna_csv, tipo_pregunta FROM cuestionarios WHERE estudio_id = ?", conn, params=(estudio_id,))
+    conn.close()
+    return df.to_dict('records') # Devolver como lista de diccionarios
+
+
+# --- Funciones de Paneles ---
+
+def save_encuestado(id_externo, nombre, comuna, edad, genero):
+    """Guarda un nuevo encuestado en la tabla de paneles. Retorna True si es exitoso."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO paneles (id_externo, nombre, comuna, edad, genero, fecha_registro) VALUES (?, ?, ?, ?, ?, ?)",
+                  (id_externo, nombre, comuna, edad, genero, datetime.now().strftime("%Y-%m-%d")))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Error detallado: {e}")
+        return False
+    finally:
+        conn.close()
+
+@st.cache_data
+def get_all_encuestados():
+    """Recupera todos los encuestados guardados en la DB."""
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT id, id_externo, nombre, comuna, edad, genero, fecha_registro FROM paneles ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+# --- 3. GESTIÓN DE DATOS DE ENCUESTAS (ANÁLISIS) ---
+
+def convert_df_to_csv(df):
+    """Convierte un DataFrame a un string CSV codificado para descarga."""
+    return df.to_csv(index=False).encode('utf-8')
+
+def calcular_nps_y_avance(df_respuestas):
+    """Calcula NPS, avance y clasifica respuestas. Devuelve el DF modificado."""
+    if df_respuestas is None or df_respuestas.empty:
+        return 0, 0, 0, 0, pd.DataFrame() 
+    
+    total_respuestas = len(df_respuestas)
+    
+    try:
+        # Intenta convertir la columna NPS y maneja errores
+        df_respuestas['nps_score'] = pd.to_numeric(df_respuestas['nps_score'], errors='coerce')
+        # Filtra solo los valores entre 0 y 10 para el cálculo
+        df_nps = df_respuestas[(df_respuestas['nps_score'] >= 0) & (df_respuestas['nps_score'] <= 10)].copy()
+        
+    except KeyError:
+        # Esto es un error grave si la columna NPS no existe
+        return 0, 0, 0, 0, df_respuestas 
+    except Exception as e:
+        st.error(f"Error inesperado al calcular NPS: {e}")
+        return 0, 0, 0, 0, df_respuestas
+
+    
+    if df_nps.empty:
+        # No hay datos válidos para NPS, pero se devuelve el DF original
+        return total_respuestas, 0, 0, 0, df_respuestas
+        
+    df_nps['nps_categoria'] = np.select(
+        [df_nps['nps_score'] >= 9, df_nps['nps_score'] >= 7],
+        ['Promotor', 'Neutro'],
+        default='Detractor'
+    )
+    
+    total_validas = len(df_nps)
+    promotores = df_nps[df_nps['nps_categoria'] == 'Promotor']
+    detractores = df_nps[df_nps['nps_categoria'] == 'Detractor']
+    
+    percent_promotores = (len(promotores) / total_validas) * 100 if total_validas > 0 else 0
+    percent_detractores = (len(detractores) / total_validas) * 100 if total_validas > 0 else 0
+    
+    nps_score = percent_promotores - percent_detractores
+    
+    # Añadir la columna de categoría al DF original para uso posterior si es necesario
+    if 'nps_categoria_new' in df_respuestas.columns:
+        df_respuestas['nps_categoria'] = df_respuestas['nps_categoria_new'].fillna('No Aplica')
+    else:
+        df_respuestas['nps_categoria'] = 'No Aplica'
+        
+    df_respuestas = df_respuestas.drop(columns=['nps_categoria_new'], errors='ignore')
+
+    return total_validas, nps_score, percent_promotores, percent_detractores, df_respuestas
+    
+
+def clean_text(text):
+    """Limpia el texto, elimina puntuación y stopwords en español."""
+    if pd.isna(text) or text is None:
+        return ""
+    
+    text = str(text).lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    spanish_stopwords = set(stopwords.words('spanish'))
+    words = text.split()
+    words = [word for word in words if word not in spanish_stopwords]
+    
+    return " ".join(words)
+
+# =======================================================
+# --- 4. FUNCIONES DE VISTAS (PÁGINAS) ---
+# =======================================================
+
+# 🎨 FUNCIÓN DE TEMA PERSONALIZADO 
+def set_theme():
+    """Permite al usuario seleccionar el tema usando un toggle switch e inyecta CSS.
+    Asegura la Consistencia de Tarjetas (KPIs y Contenedores)."""
+
+    # Definimos los colores clave
+    SIDEBAR_COLOR_DARK = "#0D1117"    
+    MAIN_CONTENT_COLOR_DARK = "#1A1A2E" 
+    CARD_COLOR_DARK = "#1F1728"       
+    TEXT_COLOR_DARK = "#FAFAFA" 
+    LIGHT_BLUE_BACKGROUND_START = "#87CEEB" 
+    LIGHT_BLUE_BACKGROUND_END = "#B3E0F2"   
+    LIGHT_BLUE_TEXT = "#2C3E50"             
+    LIGHT_BLUE_BUTTON = "#87CEEB"       
+    LIGHT_BLUE_BUTTON_PRIMARY = "#4682B4"   
+    NEW_LIGHT_SIDEBAR_COLOR = "#A9C6D8" 
+    LIGHT_ELEMENT_BACKGROUND = "#B3E0F2" 
+    
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Selector de Tema")
+        
+        is_dark_theme = st.session_state.get('theme') == 'Dark'
+        
+        if is_dark_theme:
+            toggle_label = "Cambiar a Modo Claro (Azul Día) ☀️"
+            toggle_value = True 
+            toggle_help = "Desactiva para cambiar a Tema Azul Día (Claro)"
+        else:
+            toggle_label = "Cambiar a Modo Oscuro (Azul Noche) 🌙"
+            toggle_value = False 
+            toggle_help = "Activa para cambiar a Tema Azul Noche (Oscuro)"
+
+        theme_toggle = st.toggle(
+            label=toggle_label, 
+            value=toggle_value,
+            key="theme_toggle_global",
+            help=toggle_help
+        )
+        
+        new_theme = 'Dark' if theme_toggle else 'Light'
+        
+        if st.session_state['theme'] != new_theme:
+            st.session_state['theme'] = new_theme
+            st.rerun()
+
+    if st.session_state['theme'] == 'Dark':
+        st.markdown(
+            f"""
+            <style>
+            /* ------------------- TEMA AZUL NOCHE/MORADO (DARK) ------------------- */
+            
+            /* Fondo y Color de texto base para toda la página */
+            html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewBlockContainer"] {{ 
+                background-color: {MAIN_CONTENT_COLOR_DARK};
+                color: {TEXT_COLOR_DARK};
+            }}
+
+            /* Fondo del Sidebar */
+            [data-testid="stSidebar"] {{ 
+                background-color: {SIDEBAR_COLOR_DARK};
+            }}
+            
+            /* FUERZA EL TEXTO BLANCO EN TODOS LOS ELEMENTOS CLAVE, incluyendo el sidebar */
+            p, h1, h2, h3, h4, h5, 
+            [data-testid="stText"], 
+            .st-emotion-cache-1jm6asj, 
+            .st-emotion-cache-1jm6asj > label, 
+        
+            /* Elementos dentro del sidebar deben tener texto blanco */
+            [data-testid="stSidebar"] p,
+            [data-testid="stSidebar"] label,
+            [data-testid="stSidebar"] .st-emotion-cache-1jm6asj, 
+            
+            [data-testid="stButton"] > button,
+            [data-testid="stSelectbox"] > div > div > div > button > div > div > div, 
+            [data-testid="stMetric"] label,
+            [data-testid="stMetric"] div[data-testid="stMarkdownContainer"]
+            {{
+                color: {TEXT_COLOR_DARK} !important;
+            }}
+            
+            /* Consistencia de Tarjetas: Contenedores (st.columns, st.container) y KPIs (st.metric) */
+            [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"],
+            [data-testid="stMetric"] {{
+                background-color: {CARD_COLOR_DARK};
+                border-radius: 8px;
+                padding: 10px;
+                color: {TEXT_COLOR_DARK}; 
+            }}
+            
+            /* Estilo para Botones (Normales y Primarios) */
+            .stButton>button {{
+                background-color: #382C4A;
+                border-color: #554868;
+                color: {TEXT_COLOR_DARK};
+            }}
+            /* Botones Primarios (ej: 'Ingresar', 'Registrarse') */
+            .stButton>button[kind="primary"] {{
+                background-color: #8A2BE2;
+                color: white !important;
+            }}
+            
+            /* Adaptar inputs (Textos, números, fechas) */
+            [data-testid="stTextInput"] > div > div > input, 
+            [data-testid="stDateInput"] > div > div > input, 
+            [data-testid="stSelectbox"] > div > div > div > button,
+            [data-testid="stTextArea"] > div > div > textarea
+            {{
+                background-color: {CARD_COLOR_DARK};
+                color: {TEXT_COLOR_DARK};
+            }}
+            
+            /* --- ESTILO PARA ENCABEZADOS DE COLUMNA SIMULADOS --- */
+            /* Esto mantiene la apariencia de tabla para las cabeceras */
+            [data-testid="stHorizontalBlock"] > div > div > div {{
+                 background-color: {CARD_COLOR_DARK};
+                 border-radius: 8px;
+            }}
+            
+            </style>
+            """
+            .replace('\n', '') 
+            .replace('  ', ''), 
+            unsafe_allow_html=True
+        )
+        
+    else:
+        # CSS para los COLORES AZULES CLAROS DE DÍA (Tema Claro)
+        st.markdown(
+            f"""
+            <style>
+            /* ------------------- TEMA CLARO CON GRADIENTE AZUL CLARO ------------------- */
+            
+            /* Fondo de la página en la vista de Login/Registro y principal */
+            html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewBlockContainer"] {{
+                background-image: linear-gradient(135deg, {LIGHT_BLUE_BACKGROUND_START} 0%, {LIGHT_BLUE_BACKGROUND_END} 100%); 
+                background-color: {LIGHT_BLUE_BACKGROUND_START}; 
+                color: {LIGHT_BLUE_TEXT}; 
+            }}
+        
+            /* Fondo del Sidebar */
+            [data-testid="stSidebar"] {{
+                background-color: {NEW_LIGHT_SIDEBAR_COLOR};
+            }}
+            
+            /* Asegurar el color de texto en el modo claro */
+            p, h1, h2, h3, h4, h5, 
+            [data-testid="stText"], 
+            .st-emotion-cache-1jm6asj, 
+            .st-emotion-cache-1jm6asj > label, 
+        
+            [data-testid="stSidebar"] p,
+            [data-testid="stSidebar"] label,
+            [data-testid="stButton"] > button,
+            [data-testid="stSelectbox"] > div > div > div > button > div > div > div, 
+            [data-testid="stMetric"] label,
+            [data-testid="stMetric"] div[data-testid="stMarkdownContainer"]
+            {{
+                color: {LIGHT_BLUE_TEXT} !important;
+            }}
+            
+            /* Consistencia de Tarjetas: Contenedores (st.columns, st.container) y KPIs (st.metric) */
+            [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"],
+            [data-testid="stMetric"] {{
+                background-color: {LIGHT_ELEMENT_BACKGROUND};
+                border-radius: 8px;
+                padding: 10px;
+                color: {LIGHT_BLUE_TEXT}; 
+                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); 
+            }}
+            
+            /* Estilo para Botones (Normales y Primarios) */
+            .stButton>button {{
+                background-color: {LIGHT_BLUE_BUTTON};
+                color: white; 
+                border-color: {LIGHT_BLUE_BUTTON_PRIMARY};
+            }}
+            /* Botones Primarios */
+            .stButton>button[kind="primary"] {{
+                background-color: {LIGHT_BLUE_BUTTON_PRIMARY};
+                color: white;
+            }}
+            /* Inputs (Textos, números, fechas) */
+            [data-testid="stTextInput"] > div > div > input, 
+            [data-testid="stDateInput"] > div > div > input, 
+            [data-testid="stSelectbox"] > div > div > div > button,
+            [data-testid="stTextArea"] > div > div > textarea
+            {{
+                background-color: {LIGHT_ELEMENT_BACKGROUND};
+                color: {LIGHT_BLUE_TEXT};
+            }}
+            
+            /* --- ESTILO PARA ENCABEZADOS DE COLUMNA SIMULADOS --- */
+            [data-testid="stHorizontalBlock"] > div > div > div {{
+                 background-color: {LIGHT_ELEMENT_BACKGROUND};
+                 border-radius: 8px;
+            }}
+            
+            </style>
+            """
+            .replace('\n', '') 
+            .replace('  ', ''), 
+            unsafe_allow_html=True
+        )
+
+
+def login_page():
+    """Muestra la página de Login. Uso de st.header unificado."""
+    st.header("🔑 Acceso al Sistema de Estudios")
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.subheader("Ingresa tus Credenciales")
+        with st.form("login_form"):
+            username = st.text_input("Usuario")
+            password = st.text_input("Contraseña", type="password")
+            submit_button = st.form_submit_button("Ingresar", type="primary")
+
+            if submit_button:
+                if verify_user(username, password):
+                    st.session_state['logged_in'] = True
+                    st.session_state['current_view'] = 'home'
+                    st.session_state['username'] = username
+                    st.rerun() 
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+        
+        st.markdown("---")
+        
+        # Botón para ir al Registro
+        st.write("¿No tienes cuenta?")
+        if st.button("Crear una Cuenta Nueva", key="goto_registro"):
+            st.session_state['current_view'] = 'registro' 
+            st.rerun()
+            
+        # NUEVO BOTÓN PARA RECUPERAR CONTRASEÑA
+        if st.button("🔒 ¿Olvidaste tu contraseña?", key="goto_reset"):
+            st.session_state['current_view'] = 'reset_password'
+            st.rerun()
+
+def reset_password_page():
+    """Muestra la página para restablecer la contraseña."""
+    st.title("🔒 Restablecer Contraseña")
+    st.markdown("Ingresa tu **nombre de usuario** y la **nueva contraseña** que deseas utilizar.")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        with st.form("reset_password_form"):
+            username_reset = st.text_input("Nombre de Usuario", key="username_reset")
+            new_password = st.text_input("Nueva Contraseña", type="password", key="new_password_reset")
+            confirm_password = st.text_input("Confirmar Nueva Contraseña", type="password", key="confirm_password_reset")
+            
+            reset_button = st.form_submit_button("Actualizar Contraseña", type="primary")
+            
+            if reset_button:
+                if not username_reset or not new_password or not confirm_password:
+                    st.error("Todos los campos son obligatorios.")
+                elif new_password != confirm_password:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    
+                    # 1. Verificar si el usuario existe
+                    c.execute("SELECT username FROM users WHERE username=?", (username_reset,))
+                    user_exists = c.fetchone()
+                    
+                    if user_exists:
+                        # 2. Hashear la nueva contraseña y actualizar
+                        hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                        # El campo es 'password_hash'
+                        c.execute("UPDATE users SET password_hash=? WHERE username=?", (hashed_password, username_reset))
+                        conn.commit()
+                        
+                        st.success("✅ Contraseña actualizada con éxito. Ahora puedes iniciar sesión.")
+                        st.session_state['current_view'] = 'login' # Redirigir a login
+                        st.rerun()
+                    else:
+                        st.error("❌ Usuario no encontrado.")
+                    
+                    conn.close()
+
+        if st.button("⬅️ Volver al Inicio de Sesión"):
+            st.session_state['current_view'] = 'login'
+            st.rerun()
+
+
+def registro_page():
+    """Muestra la página de Registro. Uso de st.header unificado."""
+    st.header("👤 Crear Nueva Cuenta")
+
+    if st.button("← Volver a Ingresar"):
+        st.session_state['current_view'] = 'home'
+        st.rerun()
+
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        with st.form("registro_form"):
+            st.subheader("Datos del Nuevo Usuario")
+            
+            new_username = st.text_input("Usuario (para ingresar)*")
+            nombre = st.text_input("Nombre Completo")
+            correo = st.text_input("Correo Electrónico")
+            new_password = st.text_input("Contraseña*", type="password")
+            confirm_password = st.text_input("Confirma la Contraseña*", type="password")
+            
+            submit_button = st.form_submit_button("Registrarse", type="primary")
+
+            if submit_button:
+                if not new_username or not new_password or not confirm_password:
+                    st.error("Por favor, completa los campos de Usuario y Contraseña.")
+                elif new_password != confirm_password:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    if create_user(new_username, new_password, nombre, correo):
+                        st.success("¡Registro exitoso! Ya puedes iniciar sesión.")
+                        st.session_state['current_view'] = 'home'
+                        st.rerun()
+                    else:
+                        st.error("Error: El nombre de usuario ya existe. Intenta con otro.")
+
+
+def home_page():
+   
+    """Muestra la página principal con la tabla de estudios y botones de análisis."""
+    st.header("🏠 Gestión de Estudios de Mercado")
+
+    if st.button("➕ Agregar Estudio", type="primary"):
+        st.session_state['current_view'] = 'crear_estudio'
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("📋 Estudios Actuales")
+
+    df_estudios_db = get_all_estudios()
+
+    if df_estudios_db.empty:
+        st.warning("No hay estudios creados. ¡Usa el botón 'Agregar Estudio' para comenzar!")
+    else:
+        # Se asegura de no mostrar las columnas internas en la tabla principal
+        df_display = df_estudios_db.drop(columns=['Análisis', 'Muestra', 'Cuotas_JSON', 'Link_Cuestionario'])
+
+        # --- ESTRUCTURA DE CABECERA DE TABLA ---
+        with st.container():
+            col_id, col_titulo, col_fecha, col_estado, col_monitor, col_acciones = st.columns([0.4, 2.5, 1.2, 1.2, 1.2, 0.5])
+            with col_id: st.markdown("**ID**")
+            with col_titulo: st.markdown("**Título del Estudio**")
+            with col_fecha: st.markdown("**Fecha Inicio**")
+            with col_estado: st.markdown("**Estado**")
+            with col_monitor: st.markdown("**Técnica**")
+            with col_acciones: st.markdown("**Borrar**")
+
+        # --- BUCLE DE FILAS CON ESTILO NATIVO Y LIMPIO ---
+        for index, row in df_display.iterrows():
+            st.markdown("<hr style='margin: 5px 0; border: none; border-top: 1px solid rgba(128, 128, 128, 0.2);'>", unsafe_allow_html=True)
+            col_id, col_titulo, col_fecha, col_estado, col_monitor, col_acciones = st.columns([0.4, 2.5, 1.2, 1.2, 1.2, 0.5])
+            
+            estudio_id = int (row['ID'])
+            with col_id:
+                st.markdown(f"**{estudio_id}**")
+            with col_titulo:
+                st.markdown(f"{row['Título']}")
+            with col_fecha:
+                st.markdown(f"{row['Fecha']}")
+            with col_estado:
+                st.markdown(f"**{row['Estado']}**")
+            with col_monitor:
+                st.markdown(f"{row['Monitor']}")
+
+        with col_acciones:
+            if st.button("🗑️", key=f"del_{estudio_id}"):
+                if delete_estudio(estudio_id):
+                    st.success("Estudio eliminado")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("Error al eliminar")
+
+        # --- Botones de Interacción (Se conservan intactos abajo) ---
+        st.markdown("---")
+        st.subheader("Acceso a Detalles y Análisis")
+        
+        opciones_estudio = df_estudios_db[['ID', 'Título']].copy()
+        opciones_estudio['Display'] = opciones_estudio.apply(lambda row: f"ID {row['ID']}: {row['Título']}", axis=1)
+        
+        selected_display = st.selectbox(
+            "Selecciona un estudio para acceder:",
+            opciones_estudio['Display'].tolist(),
+            index=None, 
+            placeholder="Selecciona un estudio..."
+        )
+        
+        if selected_display:
+            selected_id_str = selected_display.split(":")[0].replace("ID ", "").strip()
+            selected_id = int(selected_id_str)
+            st.session_state['selected_estudio_id'] = selected_id
+            
+            col_detalle, col_cuestionario, col_avance, col_analisis = st.columns(4)
+
+            with col_detalle:
+                if st.button("👁️ Ver Detalles"):
+                    st.session_state['current_view'] = 'ver_detalle'
+                    st.rerun()
+            with col_cuestionario:
+                if st.button("📝 Definir Cuestionario"):
+                    st.session_state['current_view'] = 'crear_cuestionario'
+                    st.rerun()
+            with col_avance:
+                if st.button("📈 Monitorear Avance"):
+                    st.session_state['current_view'] = 'monitorear_avance'
+                    st.rerun()
+            with col_analisis:
+                if st.button("📊 Analizar Resultados", type="primary"):
+                    st.session_state['current_view'] = 'analizar_resultados'
+                    st.rerun()
+
+def crear_estudio_page():
+    """Muestra el formulario para crear un nuevo estudio."""
+    st.header("➕ Creación de Nuevo Estudio de Mercado")
+    
+    if st.button("← Volver a Home"):
+        st.session_state['current_view'] = 'home'
+        st.rerun()
+        
+    st.markdown("---")
+    
+    with st.form("nuevo_estudio_form"):
+        st.subheader("1. Datos Generales")
+        titulo = st.text_input("Título del Estudio*", key='f_titulo')
+        empresa = st.text_input("Empresa/Cliente", key='f_empresa')
+        link_cuestionario = st.text_input("Link del Cuestionario (Opcional)", key='f_link')
+
+        col_muestra, col_inicio, col_fin = st.columns(3)
+        with col_muestra:
+            muestra = st.number_input("Muestra Requerida (N)*", min_value=10, step=10, key='f_muestra')
+        with col_inicio:
+            fecha_inicio = st.date_input("Fecha Inicio de Campo", datetime.now().date(), key='f_inicio')
+        with col_fin:
+            fecha_fin = st.date_input("Fecha Fin de Campo", (datetime.now().date() + pd.Timedelta(days=7)), key='f_fin')
+            
+        st.markdown("---")
+        st.subheader("2. Cuotas Demográficas")
+        cuotas_raw = st.text_area(
+            "Cuotas Demográficas (JSON)*", 
+            value='{"genero": {"Masculino": 50, "Femenino": 50}, "region": {"Metropolitana": 70, "Valparaíso": 30}}',
+            height=200, help="Ingresa las cuotas como un objeto JSON. Las claves deben coincidir con las columnas de tu CSV (ej: 'genero', 'region')."
+        )
+        
+        st.markdown("---")
+        st.subheader("3. Archivo de Resultados (Carga Inicial)")
+        uploaded_file = st.file_uploader("Sube el archivo CSV de resultados (Debe contener una columna 'nps_score' y las columnas usadas en las cuotas)", type=['csv'])
+        
+        st.markdown("---")
+        st.subheader("4. Técnica de Recolección")
+        tecnica = st.selectbox("Selecciona la Técnica", ['CATI (Call Center)', 'CAPI (Link Web)', 'IVR (Contestada Automática)', 'CAPI (Presencial)'], key='f_tecnica')
+        
+        submit_button = st.form_submit_button("✅ GUARDAR ESTUDIO Y COMENZAR", type="primary")
+
+        if submit_button:
+            if titulo and muestra and uploaded_file is not None:
+                try:
+                    cuotas_validadas = json.loads(cuotas_raw)
+                    cuotas_json_string = cuotas_raw
+                except json.JSONDecodeError:
+                    st.error("Error en el formato de las Cuotas Demográficas. Asegúrate de usar un JSON válido.")
+                    return
+
+                try:
+                    df_cargado = pd.read_csv(uploaded_file)
+                    if 'nps_score' not in df_cargado.columns:
+                        st.error("Error: El archivo CSV debe contener una columna llamada 'nps_score'.")
+                        return
+                    
+                    # Convertir nombres de columna a minúsculas para coincidir con la convención de cuotas
+                    df_cargado.columns = df_cargado.columns.str.lower()
+                    
+                    estudio_id = save_estudio(titulo, fecha_inicio, fecha_fin, empresa, int(muestra), tecnica, cuotas_json_string, link_cuestionario)
+                    st.session_state['last_loaded_df'] = df_cargado
+                    st.session_state['last_loaded_id'] = estudio_id
+
+                    st.success(f"Estudio '{titulo}' (ID: {estudio_id}) creado y datos cargados.")
+                    # Redirigir a definir cuestionario
+                    st.session_state['selected_estudio_id'] = estudio_id
+                    st.session_state['current_view'] = 'crear_cuestionario'
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Error al procesar o guardar el estudio/archivo: {e}")
+            else:
+                st.error("Por favor, completa el Título, Muestra y sube el Archivo CSV.")
+
+def crear_cuestionario_page():
+    """Página para cargar o crear automáticamente el cuestionario del estudio."""
+    st.header("📝 Gestión y Creación de Cuestionario")
+
+    if st.button("← Volver a Home", key="btn_volver_cuestionario"):
+        st.session_state['current_view'] = 'home'
+        st.rerun()
+
+    st.markdown("---")
+
+    estudio_id = st.session_state.get('selected_estudio_id')
+    if not estudio_id:
+        st.warning("⚠️ Primero debes seleccionar un estudio en el Home.")
+        if st.button("Ir al Home"):
+            st.session_state['current_view'] = 'home'
+            st.rerun()
+        return
+
+    st.info(f"Configurando cuestionario para el Estudio ID: {estudio_id}")
+
+    tab_gform, tab_auto = st.tabs(["Cargar Google Form", "Crear Cuestionario Automático"])
+
+    with tab_gform:
+        st.subheader("Vincular Cuestionario de Google Forms")
+        with st.form("form_gform"):
+            link_form = st.text_input("URL del Formulario de Google Forms")
+            btn_gform = st.form_submit_button("🔗 Vincular Formulario", type="primary")
+            if btn_gform:
+                if link_form:
+                    st.success("✅ ¡Formulario vinculado correctamente al estudio!")
+                else:
+                    st.error("Por favor ingresa un enlace válido.")
+
+    with tab_auto:
+        st.subheader("Constructor Automático de Preguntas")
+        with st.form("form_auto_cuestionario"):
+            pregunta_texto = st.text_input("Texto de la Pregunta")
+            tipo_pregunta = st.selectbox(
+                "Tipo de Pregunta",
+                ["Binaria (Sí/No)", "Selección Única", "Selección Múltiple", "Escala (NPS / Likert)", "Abierta (Texto)"]
+            )
+            columna_csv = st.text_input("Nombre de la columna asociada (ej: p1_marca)")
+            
+            btn_add_p = st.form_submit_button("➕ Añadir Pregunta al Cuestionario")
+            if btn_add_p:
+                if pregunta_texto and columna_csv:
+                    st.success(f"✅ Pregunta '{pregunta_texto}' agregada exitosamente.")
+                else:
+                    st.error("Completa el texto de la pregunta y el nombre de la columna.")
+                    
+def ver_detalle_page(estudio_id):
+    """Muestra los detalles completos de un estudio."""
+    mostrar_botones_estudio_activo()
+    st.header(f"👁️ Detalles del Estudio ID: {estudio_id}")
+
+    estudio_details = get_estudio_details(estudio_id)
+    
+    if estudio_details is None:
+        st.error("Estudio no encontrado.")
+        return
+
+    st.markdown("---")
+    
+    # Columna 1: Datos Generales
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Información General")
+        st.write(f"**Título:** {estudio_details['titulo']}")
+        st.write(f"**Empresa/Cliente:** {estudio_details['empresa'] or 'N/A'}")
+        st.write(f"**Muestra Requerida (N):** {estudio_details['muestra']:,}")
+        st.write(f"**Técnica:** {estudio_details['tecnica']}")
+        st.write(f"**Inicio de Campo:** {estudio_details['fecha_inicio']}")
+        st.write(f"**Fin de Campo:** {estudio_details['fecha_fin']}")
+        st.write(f"**Link Cuestionario:** {estudio_details['link_cuestionario'] or 'N/A'}")
+
+    # Columna 2: Estado y Cuotas
+    with col2:
+        st.subheader("Estado y Control")
+        state_options = ['Creación de Estudio', 'Campo Activo', 'Campo Finalizado', 'Cerrado/Analizado']
+        try:
+            initial_index = state_options.index(estudio_details['estado'])
+        except ValueError:
+            initial_index = 0 # default if state not found
+            
+        new_state = st.selectbox(
+            "Cambiar Estado",
+            state_options,
+            index=initial_index
+        )
+
+        if new_state != estudio_details['estado']:
+            if st.button("Actualizar Estado"):
+                if update_estudio_state(estudio_id, new_state):
+                    st.success(f"Estado actualizado a: {new_state}")
+                    st.rerun()
+                else:
+                    st.error("Error al actualizar el estado.")
+        
+        st.markdown("---")
+        st.subheader("Cuotas Requeridas (JSON)")
+        try:
+            st.json(json.loads(estudio_details['cuotas_json']))
+        except (json.JSONDecodeError, TypeError):
+            st.warning("El formato de cuotas es inválido.")
+
+
+def crear_cuestionario_page():
+    """ Simula la creación de un cuestionario mapeando las columnas del CSV a nombres de preguntas amigables."""
+    st.header("📝 Definición del Cuestionario (Mapeo de Preguntas)")
+    
+    # AQUÍ LLAMAS A TUS NUEVOS BOTONES:
+    mostrar_botones_estudio_activo()
+    
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df = st.session_state.get('last_loaded_df')
+    # ... (el resto de tu código sigue igual abajo)
+    
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df = st.session_state.get('last_loaded_df')
+    
+    if estudio_id is None:
+        st.warning("Debes seleccionar un estudio para definir el cuestionario.")
+        return
+
+    # ----------------------------------------------------------------------
+    # Lógica de carga del DF si no está en sesión (simulación de persistencia)
+    if df is None:
+        st.warning("No hay datos de respuesta cargados en la sesión para este estudio. Vuelve a 'Crear Nuevo Estudio' o carga la base en el análisis.")
+        return
+    # ----------------------------------------------------------------------
+    
+    # 1. Cargar preguntas existentes (si las hay) o inicializar con columnas del DF
+    preguntas_existentes = get_questions_by_study(estudio_id)
+    
+    # Mapear las columnas del DF
+    columnas_df = df.columns.tolist()
+    TIPO_OPCIONES = ['Single (Opción Única)', 'Multiple (Opción Múltiple)', 'NPS', 'Abierta (Texto)', 'Demográfico', 'ID', 'Calculada/Auxiliar']
+    
+    # 2. Inicializar el formulario con datos
+    if not preguntas_existentes:
+        # Inicializar con todas las columnas
+        initial_data = [{'columna': col, 'texto': col.replace('_', ' ').capitalize(), 'tipo': 'Single (Opción Única)'} for col in columnas_df]
+    else:
+        # Usar los datos existentes, mapeados por 'columna_csv'
+        map_existente = {q['columna_csv']: q for q in preguntas_existentes}
+        initial_data = []
+        for col in columnas_df:
+            if col in map_existente:
+                initial_data.append({
+                    'columna': col, 
+                    'texto': map_existente[col]['pregunta_texto'], 
+                    'tipo': map_existente[col]['tipo_pregunta']
+                })
+            else:
+                # Si es una columna nueva, añadirla al final
+                initial_data.append({'columna': col, 'texto': col.replace('_', ' ').capitalize(), 'tipo': 'Single (Opción Única)'})
+
+    # Formulario para mapeo
+    with st.form("cuestionario_form"):
+        st.subheader(f"Mapeo de {len(initial_data)} Columnas")
+        preguntas_a_guardar = []
+        
+        # Encabezado de la tabla simulada
+        col_csv, col_texto, col_tipo = st.columns([1, 3, 1])
+        with col_csv: st.markdown("##### Columna CSV")
+        with col_texto: st.markdown("##### Texto de la Pregunta")
+        with col_tipo: st.markdown("##### Tipo")
+        st.markdown("---")
+
+        for i, item in enumerate(initial_data):
+            # Asignar un tipo por defecto más inteligente para NPS/Demográficos/ID si es nuevo
+            default_type = item['tipo']
+            if item['columna'] == 'nps_score' and not preguntas_existentes:
+                default_type = 'NPS'
+            elif item['columna'] in ['genero', 'edad', 'region'] and not preguntas_existentes:
+                default_type = 'Demográfico'
+            elif item['columna'] in ['id_encuesta', 'id'] and not preguntas_existentes:
+                default_type = 'ID'
+                
+            col_csv, col_texto, col_tipo = st.columns([1, 3, 1])
+            with col_csv:
+                st.text(item['columna'])
+            with col_texto:
+                texto_input = st.text_input("Pregunta", value=item['texto'], key=f"q_text_{i}", label_visibility="collapsed")
+            with col_tipo:
+                # Asegurar que el tipo guardado sea una opción válida, si no, usar el por defecto
+                try:
+                    default_index = TIPO_OPCIONES.index(default_type)
+                except ValueError:
+                    default_index = 0 # Single por defecto si no se reconoce
+                tipo_select = st.selectbox("Tipo", TIPO_OPCIONES, index=default_index, key=f"q_type_{i}", label_visibility="collapsed")
+
+            # Preparar los datos para guardar
+            preguntas_a_guardar.append({
+                'columna': item['columna'],
+                'texto': texto_input,
+                'tipo': tipo_select
+            })
+
+        submit_button = st.form_submit_button("💾 Guardar Definición del Cuestionario", type="primary")
+
+        if submit_button:
+            # 3. Guardar las preguntas en la base de datos
+            save_questions(estudio_id, preguntas_a_guardar)
+            st.success(f"✅ Se guardaron {len(preguntas_a_guardar)} preguntas para el estudio ID {estudio_id}.")
+            update_estudio_state(estudio_id, "Cuestionario Definido") # Actualizar estado
+            st.session_state['current_view'] = 'home'
+            st.rerun()
+
+def mostrar_botones_estudio_activo():
+    """Muestra la barra de botones de navegación rápida para el estudio seleccionado."""
+    st.markdown("---")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        # Aquí mantenemos tu botón de volver original
+        if st.button("← Volver a Home", key="nav_home_sup"):
+            st.session_state['current_view'] = 'home'
+            st.rerun()
+    with col2:
+        if st.button("Ver Detalles", key="nav_detalles_sup"):
+            st.session_state['current_view'] = 'ver_estudio'
+            st.rerun()
+    with col3:
+        if st.button("Definir Cuestionario", key="nav_cuestionario_sup"):
+            st.session_state['current_view'] = 'definir_cuestionario'
+            st.rerun()
+    with col4:
+        if st.button("Monitorear Avance", key="nav_avance_sup"):
+            st.session_state['current_view'] = 'monitorear_avance'
+            st.rerun()
+    with col5:
+        if st.button("Analizar Resultados", key="nav_analizar_sup"):
+            st.session_state['current_view'] = 'analizar_resultados'
+            st.rerun()
+    st.markdown("---")
+def monitorear_avance_page():
+    """Página de monitoreo de avance de campo y cumplimiento de cuotas."""
+    st.header("📈 Monitoreo de Avance de Campo")
+    mostrar_botones_estudio_activo()
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df_respuestas = st.session_state.get('last_loaded_df')
+    
+    if estudio_id is None:
+        st.warning("Selecciona un estudio en el Home para monitorear el avance.")
+        return
+        
+    estudio_details = get_estudio_details(estudio_id)
+    if estudio_details is None:
+        st.error("Detalles del estudio no encontrados.")
+        return
+
+    st.subheader(f"Avance para: {estudio_details['titulo']} (N: {estudio_details['muestra']:,})")
+    
+    # ----------------------------------------------------------------------
+    # Lógica de carga del DF si no está en sesión (simulación de persistencia)
+    if df_respuestas is None:
+        st.warning("No hay datos de respuesta cargados en la sesión para este estudio.")
+        st.info("Para continuar, regresa a 'Crear Nuevo Estudio' y carga el archivo inicial.")
+        return
+    # ----------------------------------------------------------------------
+    
+    muestra_requerida = estudio_details['muestra']
+    total_respuestas = len(df_respuestas)
+    delta_n = total_respuestas - (st.session_state.get('last_total_respuestas', 0))
+    delta_text = f"+{delta_n:,} desde la última actualización" if delta_n > 0 else None
+    st.session_state['last_total_respuestas'] = total_respuestas
+    
+    cuotas_json_string = estudio_details['cuotas_json']
+
+    tab_general, tab_cuotas, tab_preguntas = st.tabs(["Avance General", "Cumplimiento de Cuotas", "Avance por Pregunta"])
+    
+    with tab_general:
+        st.subheader("Indicadores Clave de Avance")
+        # Aseguramos que los metrics se vean como "tarjetas" gracias al CSS custom
+        col_req, col_comp, col_pend = st.columns(3)
+        with col_req:
+            st.metric(label="Muestra Total Requerida", value=f"{muestra_requerida:,}")
+        with col_comp:
+            st.metric(label="Encuestas Completadas", value=f"{total_respuestas:,}", delta=delta_text)
+        with col_pend:
+            st.metric(label="Pendientes por Completar", value=f"{max(0, muestra_requerida - total_respuestas):,}")
+
+    with tab_cuotas:
+        st.subheader("Avance por Cuota Demográfica (Datos Reales)")
+        if df_respuestas is None or df_respuestas.empty:
+            st.info("Carga el archivo de resultados para ver el cumplimiento de cuotas.")
+            return
+            
+        try:
+            cuotas = json.loads(cuotas_json_string)
+        except (json.JSONDecodeError, TypeError):
+            st.error("Error al procesar el JSON de Cuotas. Revise el formato en la creación del estudio.")
+            return
+
+        for columna, valores_cuota in cuotas.items():
+            if columna not in df_respuestas.columns:
+                st.warning(f"La columna de cuota **'{columna}'** no se encontró en los datos de respuesta cargados.")
+                continue
+
+            st.markdown(f"#### Cuota por: {columna.capitalize()}")
+            
+            # Asegura que los valores de la columna sean strings para el conteo consistente
+            frecuencias_reales = df_respuestas[columna].astype(str).value_counts().to_dict()
+            
+            data_cuotas_list = []
+            for valor, requerido in valores_cuota.items():
+                completado = frecuencias_reales.get(valor, 0)
+                pendiente = max(0, requerido - completado)
+                data_cuotas_list.append({
+                    'Cuota': f"{columna.capitalize()}: {valor}",
+                    'Requerida': requerido,
+                    'Completada': completado,
+                    'Pendiente': pendiente
+                })
+            
+            df_cuotas_avance = pd.DataFrame(data_cuotas_list)
+            df_cuotas_avance['% Completado'] = (df_cuotas_avance['Completada'] / df_cuotas_avance['Requerida'] * 100).round(1).astype(str) + '%'
+            
+            st.dataframe(df_cuotas_avance.set_index('Cuota'), use_container_width=True)
+            
+            # Gráfico de Avance
+            fig = px.bar(
+                df_cuotas_avance.sort_values(by='Pendiente', ascending=False),
+                x='Cuota',
+                y=['Completada', 'Pendiente'],
+                title=f'Avance de Cuotas por {columna.capitalize()}',
+                labels={'value': 'Encuestas', 'Cuota': 'Categoría'},
+                color_discrete_map={'Completada': '#4CAF50', 'Pendiente': '#F44336'},
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab_preguntas:
+        st.subheader("Avance Detallado por Pregunta")
+        preguntas = get_questions_by_study(estudio_id)
+        
+        if not preguntas:
+            st.warning("Aún no has definido el Cuestionario. Vuelve al Home para hacerlo.")
+            return
+            
+        # Simplemente contamos cuántas respuestas no son nulas por columna
+        st.markdown("Aquí se muestran el número de respuestas válidas para cada pregunta.")
+        
+        df_avance_q = []
+        for q in preguntas:
+            col_csv = q['columna_csv']
+        texto = q.get('columna', q.get('pregunta', 'Sin texto'))
+        if col_csv in df_respuestas.columns:
+                n_validas = df_respuestas[col_csv].dropna().shape[0]
+                df_avance_q.append({
+                    'Pregunta': texto,
+                    'Columna': col_csv,
+                    'N Válidas': f"{n_validas:,}",
+                    '% Avance': f"{(n_validas / total_respuestas * 100):.1f}%" if total_respuestas > 0 else '0.0%'
+                })
+        
+        df_avance_q = pd.DataFrame(df_avance_q).set_index('Pregunta')
+        st.dataframe(df_avance_q, use_container_width=True)
+def exportar_resultados_excel():
+    """Genera un archivo Excel descargable con los resultados procesados del estudio."""
+    st.subheader("📥 Exportar Reporte del Estudio")
+    
+    df_respuestas = st.session_state.get('last_loaded_df')
+    estudio_id = st.session_state.get('selected_estudio_id')
+    
+    if df_respuestas is None or df_respuestas.empty:
+        st.warning("⚠️ No hay datos cargados para exportar.")
+        return
+
+    import io
+    output = io.BytesIO()
+    
+    # Escribir el DataFrame a un archivo de Excel en memoria
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_respuestas.to_excel(writer, index=False, sheet_name='Resultados_Estudio')
+    
+    processed_data = output.getvalue()
+    
+    st.download_button(
+        label="📥 Descargar Reporte en Excel (.xlsx)",
+        data=processed_data,
+        file_name=f"reporte_estudio_{estudio_id}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+def analizar_resultados_page():
+    """Dashboard avanzado de análisis, cruce de variables y cálculo automatizado de NPS."""
+    st.header("📊 Dashboard de Análisis y Resultados")
+
+    mostrar_botones_estudio_activo()
+
+    st.markdown("---")
+
+    estudio_id = st.session_state.get('selected_estudio_id')
+
+    if not estudio_id:
+        st.warning("⚠️ Debes seleccionar un estudio en el Home.")
+        return
+
+    df_respuestas = st.session_state.get('last_loaded_df')
+    
+    if df_respuestas is None:
+        st.warning("⚠️ Este estudio aún no tiene un archivo de respuestas cargado. Súbelo aquí para ver el análisis:")
+        
+        uploaded_file = st.file_uploader("Selecciona el archivo de respuestas (CSV o Excel)", type=["csv", "xlsx", "xls"], key="uploader_analisis_rapido")
+        
+        if uploaded_file is not None:
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    df_respuestas = pd.read_csv(uploaded_file)
+                else:
+                    df_respuestas = pd.read_excel(uploaded_file)
+                
+                df_respuestas.columns = df_respuestas.columns.str.lower()
+                
+                # Validación de columnas requeridas
+                if 'nps_score' not in df_respuestas.columns:
+                    st.error("⚠️ El archivo cargado no contiene la columna obligatoria 'nps_score'. Por favor revisa el formato.")
+                    return
+                
+                st.session_state['last_loaded_df'] = df_respuestas
+                st.success("¡Archivo cargado y validado con éxito!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al leer el archivo: {e}")
+        return
+
+    st.info(f"Analizando resultados para el Estudio ID: {estudio_id}")
+    tab_nps, tab_binarias, tab_cruce = st.tabs(["Cálculo de NPS", "Preguntas Binarias (Sí/No)", "Cruce Demográfico"])
+
+    with tab_nps:
+        st.subheader("Cálculo Automatizado de NPS")
+        tipo_escala = st.selectbox(
+            "Selecciona la escala de ponderación del NPS",
+            ["Escala 0 a 10 (Clásico)", "Escala 1 a 7", "Escala 1 a 5"]
+        )
+        
+        if 'nps_score' in df_respuestas.columns:
+            scores = df_respuestas['nps_score'].dropna()
+            total_respuestas = len(scores)
+            
+            if total_respuestas > 0:
+                if "0 a 10" in tipo_escala:
+                    promoters = len(scores[scores >= 9])
+                    detractors = len(scores[scores <= 6])
+                elif "1 a 7" in tipo_escala:
+                    promoters = len(scores[scores >= 6])
+                    detractors = len(scores[scores <= 4])
+                else:
+                    promoters = len(scores[scores == 5])
+                    detractors = len(scores[scores <= 3])
+                
+                nps_value = ((promoters - detractors) / total_respuestas) * 100
+                
+                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1.metric("Total Evaluados", total_respuestas)
+                col_m2.metric("Promotores (%)", f"{(promoters/total_respuestas)*100:.1f}%")
+                col_m3.metric("Net Promoter Score (NPS)", f"{nps_value:.1f}")
+            else:
+                st.warning("No hay suficientes datos en la columna 'nps_score'.")
+        else:
+            st.error("El archivo cargado no contiene la columna 'nps_score' requerida para el cálculo.")
+
+    with tab_binarias:
+        st.subheader("Análisis de Preguntas Binarias y Selección")
+        columnas_disponibles = df_respuestas.columns.tolist()
+        binarias = [c for c in columnas_disponibles if c not in ['nps_score', 'id', 'comuna', 'genero', 'edad']]
+        
+        if binarias:
+            pregunta_sel = st.selectbox("Selecciona la variable/pregunta a analizar en porcentaje", binarias)
+            conteo_porcentajes = df_respuestas[pregunta_sel].value_counts(normalize=True) * 100
+            st.bar_chart(conteo_porcentajes)
+            st.dataframe(conteo_porcentajes.reset_index().rename(columns={'index': 'Respuesta', pregunta_sel: 'Porcentaje (%)'}))
+        else:
+            st.info("No se detectaron preguntas adicionales para análisis binario.")
+
+    with tab_cruce:
+        st.subheader("Cruce de Variables Demográficas")
+        demograficas = [c for c in ['genero', 'region', 'comuna', 'edad'] if c in columnas_disponibles]
+        
+        if demograficas and 'nps_score' in columnas_disponibles:
+            demo_sel = st.selectbox("Selecciona variable demográfica para cruzar con NPS", demograficas)
+            cruce = df_respuestas.groupby(demo_sel)['nps_score'].mean().reset_index()
+            st.dataframe(cruce, use_container_width=True)
+            st.bar_chart(cruce.set_index(demo_sel))
+        else:
+            st.info("Se requieren variables demográficas y 'nps_score' en el dataset para realizar el cruce.")
+
+    
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df_respuestas = st.session_state.get('last_loaded_df')
+    
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df_respuestas = st.session_state.get('last_loaded_df')
+    
+    if estudio_id is None:
+        st.warning("Selecciona un estudio en el Home para analizar los resultados.")
+        return
+        
+    estudio_details = get_estudio_details(estudio_id)
+    if estudio_details is None:
+        st.error("Detalles del estudio no encontrados.")
+        return
+
+    st.subheader(f"Resultados para: {estudio_details['titulo']}")
+    
+    # ----------------------------------------------------------------------
+    # Carga de datos
+   # Obtener el ID del estudio actual para mantener los datos separados por estudio
+    estudio_id = st.session_state.get('selected_estudio_id', 'default')
+    df_key = f'df_estudio_{estudio_id}'
+    
+    # Verificar si ya tenemos un DataFrame cargado para *este* estudio específico en la sesión
+    if df_key not in st.session_state or st.session_state[df_key] is None:
+        st.warning(f"No hay datos de respuesta cargados en la sesión para este estudio (ID: {estudio_id}).")
+        
+        uploaded_file = st.file_uploader(
+            "Carga el archivo de resultados del estudio (CSV, Excel o SPSS) para el análisis.",
+            type=["csv", "xlsx", "xls", "sav"],
+            key=f"analisis_uploader_{estudio_id}"
+        )
+        
+        if uploaded_file:
+            try:
+                fname = uploaded_file.name.lower()
+                if fname.endswith(".csv"):
+                    df_respuestas = pd.read_csv(uploaded_file)
+                elif fname.endswith((".xlsx", ".xls")):
+                    df_respuestas = pd.read_excel(uploaded_file)
+                elif fname.endswith(".sav"):
+                    import pyreadstat
+                    with open("temp_spss.sav", "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    df_respuestas, meta = pyreadstat.read_sav("temp_spss.sav")
+                
+                df_respuestas.columns = df_respuestas.columns.str.lower()
+                # Guardar el DataFrame específico para este estudio en la sesión
+                st.session_state[df_key] = df_respuestas
+                st.success("¡Archivo cargado y vinculado correctamente a este estudio!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al leer el archivo: {e}")
+                return
+        else:
+            return
+    else:
+        # Si ya existe el dataframe para este estudio, lo cargamos automáticamente
+        df_respuestas = st.session_state[df_key]
+
+    # ----------------------------------------------------------------------
+    
+    # Cargar preguntas definidas para el análisis
+    preguntas = get_questions_by_study(estudio_id)
+    
+    if not preguntas:
+        st.warning("Aún no has definido el Cuestionario. Vuelve al Home para hacerlo.")
+        return
+
+    # 1. Calcular NPS y clasificar el DataFrame
+    total_validas, nps_score, percent_promotores, percent_detractores, df_respuestas = calcular_nps_y_avance(df_respuestas)
+    df_respuestas = df_respuestas.rename(columns={'nps_categoria_new': 'nps_categoria'})
+    st.session_state['last_loaded_df'] = df_respuestas # Actualizar DF en sesión con categoría NPS
+
+    tab1, tab2, tab3, tab4 = st.tabs(["NPS Score", "Tabulaciones Cruzadas", "Test de Hipótesis", "Descarga de Base"])
+    
+    with tab1:
+        st.subheader("Net Promoter Score (NPS)")
+        col_nps, col_pro, col_det, col_neut = st.columns(4)
+        
+        with col_nps:
+            st.metric(label="NPS Score", value=f"{nps_score:.1f}", delta=f"N={total_validas:,}")
+        with col_pro:
+            st.metric(label="% Promotores (9-10)", value=f"{percent_promotores:.1f}%")
+        with col_det:
+            st.metric(label="% Detractores (0-6)", value=f"{percent_detractores:.1f}%")
+        with col_neut:
+            neutros = 100 - percent_promotores - percent_detractores
+            st.metric(label="% Neutros (7-8)", value=f"{neutros:.1f}%")
+            
+        # Gráfico de Categorías NPS
+        if total_validas > 0:
+            df_nps_counts = df_respuestas['nps_categoria'].value_counts().reset_index()
+            df_nps_counts.columns = ['Categoría', 'N']
+            
+            # Asegurar que todas las categorías estén presentes para el gráfico, incluyendo 'No Aplica'
+            categorias_nps = ['Promotor', 'Neutro', 'Detractor', 'No Aplica']
+            for cat in categorias_nps:
+                if cat not in df_nps_counts['Categoría'].values:
+                    df_nps_counts.loc[len(df_nps_counts)] = {'Categoría': cat, 'N': 0}
+
+            color_map = {'Promotor': '#4CAF50', 'Neutro': '#FFC107', 'Detractor': '#F44336', 'No Aplica': '#9E9E9E'}
+            
+            fig_nps = px.bar(
+                df_nps_counts,
+                x='Categoría',
+                y='N',
+                title='Distribución de Categorías NPS',
+                text_auto='.1f',
+                color='Categoría',
+                color_discrete_map=color_map,
+                labels={'N': 'Frecuencia (N)'}
+            )
+            st.plotly_chart(fig_nps, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("---")
+    
+    st.markdown("---")
+   
+   # Filtrar preguntas para tabulación simple (excluir NPS, ID y Abiertas)
+    preguntas_tabulables = [q for q in preguntas if q.get('tipo', q.get('tipo_pregunta', '')) not in ['NPS', 'ID', 'Abierta (Texto)']]
+    
+    # 📋 Resumen Ejecutivo / Insights Automáticos
+    st.markdown("### 📌 Resumen Ejecutivo del Estudio")
+    
+    total_preguntas = len(preguntas_tabulables)
+    total_filas = len(df_respuestas) if df_respuestas is not None else 0
+    
+    col_ins1, col_ins2, col_ins3 = st.columns(3)
+    with col_ins1:
+        st.metric("Total de Muestra (N)", f"{total_filas:,}")
+    with col_ins2:
+        st.metric("Preguntas Tabuladas", total_preguntas)
+    with col_ins3:
+        if total_preguntas > 0:
+            primera_q = preguntas_tabulables[0]
+            col_ej = primera_q.get('columna', primera_q.get('columna_csv', ''))
+            if df_respuestas is not None and col_ej in df_respuestas.columns:
+                moda_val = df_respuestas[col_ej].mode()[0] if not df_respuestas[col_ej].mode().empty else "N/A"
+                st.metric("Tendencia Principal (P1)", str(moda_val))
+            else:
+                st.metric("Tendencia Principal", "Disponible")
+        else:
+            st.metric("Tendencia Principal", "N/A")
+
+    st.markdown("---")
+
+    opciones_q = {q.get('texto', q.get('tipo_pregunta', q.get('columna', 'Sin Título'))): q.get('columna', q.get('columna_csv', '')) for q in preguntas_tabulables}
+    
+    if not opciones_q:
+        st.warning("No hay preguntas tabulables definidas en el cuestionario.")
+        return
+
+    selected_q_text = st.selectbox("Selecciona la Pregunta para Tabulación", list(opciones_q.keys()))
+    col_csv = opciones_q[selected_q_text]
+    
+    if col_csv in df_respuestas.columns:
+        # Mostrar métricas de avance por pregunta
+        respuestas_validas = df_respuestas[col_csv].dropna()
+        n_validas = len(respuestas_validas)
+        n_total = len(df_respuestas)
+        percent_validas = (n_validas / n_total) * 100 if n_total > 0 else 0
+
+        st.metric(label="Respuestas Válidas (N)", value=f"{n_validas:,}", delta=f"{percent_validas:.1f}% de respuestas no nulas")
+
+        if n_validas == 0:
+            st.info("Sin respuestas válidas para mostrar tabulación.")
+            return
+
+        # 1. Calcular Frecuencias
+        frec_abs = respuestas_validas.astype(str).value_counts(dropna=False).reset_index()
+        frec_abs.columns = ['Respuesta', 'N']
+
+        # 2. Calcular porcentajes
+        frec_abs['%'] = (frec_abs['N'] / n_validas * 100).round(1)
+        frec_abs = frec_abs.sort_values(by='N', ascending=False)
+        frec_abs = frec_abs.set_index('Respuesta')
+        st.dataframe(frec_abs, use_container_width=True)
+
+        # 3. Gráfico Dinámico
+        tipo_grafico = st.selectbox(
+            "Selecciona el tipo de gráfico:",
+            ["Barras Verticales", "Barras Horizontales", "Torta (Pie)", "Dona", "Lineas"],
+            key=f"chart_type_{col_csv}"
+        )
+
+        df_chart = frec_abs.reset_index()
+
+    if tipo_grafico == "Barras Verticales":
+        fig = px.bar(
+            df_chart, x='Respuesta', y='N', text_auto=True,
+            title=f"Frecuencia de Respuestas para: {selected_q_text}",
+            labels={'N': 'Frecuencia (N)', 'Respuesta': 'Opción de Respuesta'},
+            color_discrete_sequence=['#0066CC']
+        )
+        fig.update_traces(textposition='outside')
+        st.plotly_chart(fig, use_container_width=True)
+
+    elif tipo_grafico == "Barras Horizontales":
+        fig = px.bar(
+            df_chart, y='Respuesta', x='N', text_auto=True, orientation='h',
+            title=f"Frecuencia de Respuestas para: {selected_q_text}",
+            labels={'N': 'Frecuencia (N)', 'Respuesta': 'Opción de Respuesta'},
+            color_discrete_sequence=['#0066CC']
+        )
+        fig.update_traces(textposition='outside')
+        st.plotly_chart(fig, use_container_width=True)
+
+    elif tipo_grafico == "Torta (Pie)":
+        fig = px.pie(
+            df_chart, names='Respuesta', values='N',
+            title=f"Distribución para: {selected_q_text}"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+    with tab3:
+        st.subheader("Test de Hipótesis (T-Test de Medias)")
+        st.write("Compara si la media de una variable numérica es significativamente diferente entre dos grupos de una variable categórica.")
+        
+        # 1. Selección de Variables
+        preguntas_num = [q for q in preguntas if q.get('tipo', q.get('tipo_pregunta', '')) in ['NPS', 'Calculada/Auxiliar'] or 'score' in q.get('columna', q.get('columna_csv', ''))]
+        preguntas_cat = [q for q in preguntas if q.get('tipo', q.get('tipo_pregunta', '')) in ['Single (Opción Única)', 'Demográfico']]
+
+        opciones_num = {q.get('texto', q.get('texto_pregunta', q.get('columna', 'Sin Título'))): q.get('columna', q.get('columna_csv', '')) for q in preguntas_num}
+        opciones_cat = {q.get('texto', q.get('texto_pregunta', q.get('columna', 'Sin Título'))): q.get('columna', q.get('columna_csv', '')) for q in preguntas_cat}
+        if not opciones_num or not opciones_cat:
+            st.warning("Necesitas variables numéricas y categóricas binarias (2 categorías) para realizar el T-Test.")
+            return
+            
+        col_num_sel, col_cat_sel = st.columns(2)
+        with col_num_sel:
+            col_num_text = st.selectbox("Variable Numérica (Dependiente)", list(opciones_num.keys()))
+            col_num = opciones_num[col_num_text]
+        with col_cat_sel:
+            col_cat_text = st.selectbox("Variable Categórica (Independiente - Binaria)", list(opciones_cat.keys()))
+            col_cat = opciones_cat[col_cat_text]
+            
+        # 2. Ejecutar T-Test
+        try:
+            categorias = df_respuestas[col_cat].dropna().unique()
+            if len(categorias) != 2:
+                st.error(f"La variable categórica '{col_cat_text}' debe tener exactamente dos grupos para el T-Test. Se encontraron {len(categorias)}.")
+                return
+            
+            grupo1, grupo2 = categorias[0], categorias[1]
+            
+            # Limpiar datos numéricos y categóricos
+            df_test = df_respuestas[[col_num, col_cat]].dropna().copy()
+            df_test[col_num] = pd.to_numeric(df_test[col_num], errors='coerce')
+            df_test = df_test.dropna()
+            
+            data_g1 = df_test[df_test[col_cat] == grupo1][col_num]
+            data_g2 = df_test[df_test[col_cat] == grupo2][col_num]
+            
+            if len(data_g1) < 2 or len(data_g2) < 2:
+                st.warning("No hay suficientes datos válidos en al menos uno de los grupos para realizar el T-Test.")
+                return
+            
+            # Realizar el T-Test de Student (asumiendo varianzas desiguales)
+            t_stat, p_value = stats.ttest_ind(data_g1, data_g2, equal_var=False)
+            
+        except Exception as e:
+            st.error(f"Error al ejecutar el Test de Hipótesis: {e}")
+            return
+            
+        st.markdown("---")
+        st.subheader("Resultados del T-Test (Asumiendo Varianza Desigual)")
+        
+        col_t, col_p, col_m1, col_m2 = st.columns(4)
+        with col_t: st.metric("Estadístico T", f"{t_stat:.3f}")
+        with col_p: st.metric("Valor P", f"{p_value:.3e}")
+        with col_m1: st.metric(f"Media de {grupo1}", f"{data_g1.mean():.2f} (N={len(data_g1)})")
+        with col_m2: st.metric(f"Media de {grupo2}", f"{data_g2.mean():.2f} (N={len(data_g2)})")
+        
+        alpha = 0.05
+        if p_value < alpha:
+            st.success(f"Diferencia Significativa: Se rechaza la hipótesis nula (p < {alpha}). La media de {col_num_text} es significativamente diferente entre {grupo1} y {grupo2}.")
+        else:
+            st.info(f"No hay Diferencia Significativa: No se puede rechazar la hipótesis nula (p > {alpha}).")
+
+
+    with tab4:
+        st.subheader("📥 Descarga de Base de Campo Estructurada")
+        st.write("Genera un archivo CSV o Excel de la base de datos cargada.")
+
+        # Forzar lectura desde el session_state por si no estaba cargada localmente
+        df_download = st.session_state.get('last_loaded_df', df_respuestas)
+        estudio_id_val = st.session_state.get('selected_estudio_id', 'estudio')
+
+        if df_download is not None and not df_download.empty:
+            col_dl1, col_dl2 = st.columns(2)
+            
+            with col_dl1:
+                csv_file = convert_df_to_csv(df_download)
+                st.download_button(
+                    label="📄 Descargar Base de Datos (CSV)",
+                    data=csv_file,
+                    file_name=f"base_datos_{estudio_id_val}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime='text/csv',
+                    use_container_width=True
+                )
+                
+            with col_dl2:
+                import io
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df_download.to_excel(writer, index=False, sheet_name='Respuestas')
+                buffer.seek(0)
+                
+                st.download_button(
+                    label="📊 Descargar Base de Datos (Excel .xlsx)",
+                    data=buffer,
+                    file_name=f"base_datos_{estudio_id_val}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type="primary",
+                    use_container_width=True
+                )
+                
+        else:
+            st.info("ℹ️ No hay datos cargados en la sesión para este estudio. Carga un estudio en el Home para habilitar la descarga.")
+
+def codificacion_abiertas_page():
+    """Página para la codificación de respuestas abiertas (simulada/manual)."""
+    st.header("Codificación de Respuestas Abiertas")
+
+    if st.button("← Volver a Inicio", key="btn_volver_abiertas"):
+        st.session_state['current_view'] = 'home'
+        st.rerun()
+
+    st.markdown("---")
+
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df_respuestas = st.session_state.get('last_loaded_df')
+    estudio_id = st.session_state.get('selected_estudio_id')
+    df_respuestas = st.session_state.get('last_loaded_df')
+    
+    if estudio_id is None or df_respuestas is None:
+        st.warning("Selecciona un estudio en el Home con datos cargados.")
+        return
+        
+    preguntas = get_questions_by_study(estudio_id)
+    opciones_abiertas = {
+    q.get('texto', q.get('texto_pregunta', q.get('columna', 'Sin Título'))): q.get('columna', q.get('columna_csv', ''))
+    for q in preguntas
+   if any(term in str(q.get('tipo', q.get('tipo_pregunta', ''))).lower() for term in ['abierta', 'texto', 'open'])
+}
+    
+    if not opciones_abiertas:
+        st.warning("No hay preguntas de respuesta abierta definidas para este estudio.")
+        return
+        
+    # 1. Configuración de Códigos y Variables
+    st.subheader("1. Configuración de Códigos y Variable")
+    col_var, col_code_input = st.columns([1, 2])
+    
+    with col_var:
+        selected_var_text = st.selectbox("Selecciona la Variable Abierta a Codificar", list(opciones_abiertas.keys()))
+        selected_var_col = opciones_abiertas[selected_var_text]
+        st.session_state['coding_var_abierta'] = selected_var_col
+        
+        # Filtra solo las respuestas no nulas para la variable seleccionada
+        df_respuestas = df_respuestas.rename(columns={selected_var_col: 'Respuesta'}).dropna(subset=['Respuesta'])
+        
+    with col_code_input:
+        new_code = st.text_input("Ingresa un nuevo Código de Clasificación (ej: Precio, Calidad, Servicio)", key='new_code_input')
+        if st.button("Añadir Código"):
+            if new_code and new_code not in st.session_state['coding_codes']:
+                st.session_state['coding_codes'].append(new_code)
+                st.success(f"Código '{new_code}' añadido.")
+            elif new_code in st.session_state['coding_codes']:
+                st.warning("Este código ya existe.")
+            else:
+                st.warning("Ingresa un código válido.")
+        
+        if st.session_state['coding_codes']:
+            st.markdown("##### Códigos Actuales:")
+            st.code(", ".join(st.session_state['coding_codes']))
+        else:
+            st.info("Ingresa al menos un código para empezar la codificación manual.")
+
+    # 3. Nube de Palabras para Inducción de Códigos
+    st.subheader("2. Análisis Inductivo (Nube de Palabras)")
+    if len(df_respuestas) > 0:
+        st.info("Las palabras más frecuentes pueden ayudarte a crear códigos.")
+        full_text = " ".join(df_respuestas['Respuesta'].apply(clean_text).tolist())
+        if full_text:
+            wordcloud = WordCloud(
+                width=800,
+                height=400,
+                background_color='white',
+                colormap='viridis',
+                min_font_size=10
+            ).generate(full_text)
+            
+            fig, ax = plt.subplots()
+            ax.imshow(wordcloud, interpolation='bilinear')
+            ax.axis("off")
+            st.pyplot(fig)
+        else:
+            st.info("Sin texto limpio para generar la nube de palabras.")
+
+    # 4. Codificación Manual
+    st.subheader("3. Codificación Manual de Muestra")
+    if not st.session_state['coding_codes']:
+        st.warning("Define códigos en la sección 1 para habilitar la codificación manual.")
+    elif len(df_respuestas) > 0:
+        # Muestra una pequeña muestra aleatoria (ej: 10 respuestas)
+        muestra_codificar = df_respuestas.sample(min(10, len(df_respuestas))).copy()
+        st.info("Muestra aleatoria de 10 respuestas para codificar:")
+        
+        for index, row in muestra_codificar.iterrows():
+            st.markdown(f"**Respuesta:** {row['Respuesta']}")
+            # Placeholder para la codificación (simulada)
+            selected_codes = st.multiselect(
+                "Asignar Códigos (Simulado)",
+                st.session_state['coding_codes'],
+                key=f"code_select_{index}"
+            )
+            # En una aplicación real, esto guardaría el código asignado a la base de datos.
+            st.markdown("---")
+    else:
+        st.info("No hay respuestas para codificar.")
+
+# --- AQUÍ PUEDES PEGAR LA NUEVA FUNCIÓN ---
+def crear_estudio_page():
+    """Muestra el formulario para crear un nuevo estudio."""
+    st.header("➕ Creación de Nuevo Estudio de Mercado")
+    
+    if st.button("← Volver a Home"):
+        st.session_state['current_view'] = 'home'
+        st.rerun()
+        
+    st.markdown("---")
+    
+    with st.form("nuevo_estudio_form"):
+        st.subheader("1. Datos Generales")
+        titulo = st.text_input("Título del Estudio*", key='f_titulo')
+        empresa = st.text_input("Empresa/Cliente", key='f_empresa')
+        link_cuestionario = st.text_input("Link del Cuestionario (Opcional)", key='f_link')
+
+        col_muestra, col_inicio, col_fin = st.columns(3)
+        with col_muestra:
+            muestra = st.number_input("Muestra Requerida (N)*", min_value=10, step=10, key='f_muestra')
+        with col_inicio:
+            fecha_inicio = st.date_input("Fecha Inicio de Campo", datetime.now().date(), key='f_inicio')
+        with col_fin:
+            fecha_fin = st.date_input("Fecha Fin de Campo", (datetime.now().date() + pd.Timedelta(days=7)), key='f_fin')
+            
+        st.markdown("---")
+        st.subheader("2. Cuotas Demográficas")
+        cuotas_raw = st.text_area(
+            "Cuotas Demográficas (JSON)*", 
+            value='{"genero": {"Masculino": 50, "Femenino": 50}, "region": {"Metropolitana": 70, "Valparaíso": 30}}',
+            height=200, help="Ingresa las cuotas como un objeto JSON. Las claves deben coincidir con las columnas de tu CSV (ej: 'genero', 'region')."
+        )
+        
+        st.markdown("---")
+        st.subheader("3. Archivo de Resultados (Carga Inicial)")
+        uploaded_file = st.file_uploader("Sube el archivo CSV de resultados (Debe contener una columna 'nps_score' y las columnas usadas en las cuotas)", type=['csv'])
+        
+        st.markdown("---")
+        st.subheader("4. Técnica de Recolección")
+        tecnica = st.selectbox("Selecciona la Técnica", ['CATI (Call Center)', 'CAWI (Link Web)', 'IVR (Contestada/Llamada Automática)', 'TAWI (Presencial En EL Dispocitivo)'], key='f_tecnica')
+        
+        submit_button = st.form_submit_button("✅ GUARDAR ESTUDIO Y COMENZAR", type="primary")
+
+        if submit_button:
+            if titulo and muestra and uploaded_file is not None:
+                try:
+                    cuotas_validadas = json.loads(cuotas_raw)
+                    cuotas_json_string = cuotas_raw
+                except json.JSONDecodeError:
+                    st.error("Error en el formato de las Cuotas Demográficas. Asegúrate de usar un JSON válido.")
+                    return
+
+                try:
+                    df_cargado = pd.read_csv(uploaded_file)
+                    if 'nps_score' not in df_cargado.columns:
+                        st.error("Error: El archivo CSV debe contener una columna llamada 'nps_score'.")
+                        return
+                    
+                    # Convertir nombres de columna a minúsculas para coincidir con la convención de cuotas
+                    df_cargado.columns = df_cargado.columns.str.lower()
+                    
+                    estudio_id = save_estudio(titulo, fecha_inicio, fecha_fin, empresa, int(muestra), tecnica, cuotas_json_string, link_cuestionario)
+                    st.session_state['last_loaded_df'] = df_cargado
+                    st.session_state['last_loaded_id'] = estudio_id
+
+                    st.success(f"Estudio '{titulo}' (ID: {estudio_id}) creado y datos cargados.")
+                    # Redirigir a definir cuestionario
+                    st.session_state['selected_estudio_id'] = estudio_id
+                    st.session_state['current_view'] = 'crear_cuestionario'
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Error al procesar o guardar el estudio/archivo: {e}")
+            else:
+                st.error("Por favor, completa el Título, Muestra y sube el Archivo CSV.")
+
+# --- Y LUEGO CONTINÚAN TUS OTRAS PÁGINAS ---
+def gestion_paneles_page():
+    """Página para la gestión del panel de encuestados."""
+    st.header("👥 Gestión de Paneles y Encuestados")
+
+    if st.button("← Volver a Home"):
+        st.session_state['current_view'] = 'home'
+        st.rerun()
+
+    st.markdown("---")
+
+    tab_ver, tab_crear = st.tabs(["Ver Paneles", "Registrar Nuevo Encuestado"])
+
+    with tab_ver:
+        st.subheader("Lista de Encuestados Registrados")
+        df_paneles = get_all_encuestados()
+
+        if df_paneles.empty:
+            st.info("No hay encuestados registrados. Usa la pestaña 'Registrar Nuevo Encuestado' para comenzar.")
+        else:
+            st.dataframe(df_paneles, use_container_width=True)
+            
+            # Botón de descarga
+            csv_file = convert_df_to_csv(df_paneles)
+            st.download_button(
+                label="Descargar Panel de Encuestados CSV",
+                data=csv_file,
+                file_name=f'panel_encuestados_{datetime.now().strftime("%Y%m%d")}.csv',
+                mime='text/csv',
+                type="secondary"
+            )
+
+    with tab_crear:
+        st.subheader("Registro Manual de Nuevo Encuestado")
+        with st.form("registro_encuestado_form"):
+            id_externo = st.text_input("ID Externo/Único*")
+            nombre = st.text_input("Nombre Completo")
+            col_edad, col_genero = st.columns(2)
+            with col_edad:
+                edad = st.number_input("Edad", min_value=18, max_value=100, step=1, value=30)
+            with col_genero:
+                genero = st.selectbox("Género", ['Femenino', 'Masculino', 'Otro', 'Prefiero no decir'])
+            comuna = st.text_input("Comuna/Región")
+
+            submit_button = st.form_submit_button("💾 Registrar Encuestado", type="primary")
+
+            if submit_button:
+             if id_externo and nombre:
+                if save_encuestado(id_externo, nombre, comuna, edad, genero):
+                    st.success("¡Encuestado registrado con éxito!")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("Error: Ya existe un encuestado con este ID Externo.")
+            else:
+                    st.error("Los campos ID Externo y Nombre son obligatorios.")
+
+# =======================================================
+# --- 5. FUNCIÓN PRINCIPAL DE INICIO Y RUTEO (Completa) ---
+# =======================================================
+# Aplicar el tema (debe ser la primera función en ser llamada que usa st.markdown)
+set_theme()
+
+# Si no está logueado, mostrar la página de login, registro o restablecer contraseña
+if not st.session_state['logged_in']:
+    if st.session_state['current_view'] == 'registro':
+        registro_page()
+    elif st.session_state['current_view'] == 'reset_password': # NUEVO: Ruteo de restablecer contraseña
+        reset_password_page()
+    else:
+        login_page()
+else:
+    # --- BARRA LATERAL (Sidebar) ---
+    with st.sidebar:
+        # Título de la App (Reemplaza el placeholder del logo)
+        st.markdown("## 🔍 Investigación App")
+        st.markdown("---")
+        st.header(f"Hola, {st.session_state['username']}")
+        st.markdown("---")
+        
+        # Navegación principal
+        if st.button("🏡 Home / Estudios", key="nav_home"):
+            st.session_state['current_view'] = 'home'
+            st.session_state['selected_estudio_id'] = None
+            st.session_state['last_loaded_df'] = None
+            st.rerun()
+        
+        if st.button("👥 Gestión de Paneles", key="nav_paneles"):
+            st.session_state['current_view'] = 'gestion_paneles'
+            st.rerun()
+            
+        if st.button("💬 Codificación Abiertas", key="nav_codificacion"):
+            st.session_state['current_view'] = 'codificacion_abiertas'
+            st.rerun()
+
+        st.markdown("---")
+        # Botón de Logout
+        if st.button("🚪 Cerrar Sesión"):
+            st.session_state['logged_in'] = False
+            st.session_state['current_view'] = 'home'
+            st.session_state['username'] = None
+            st.session_state['selected_estudio_id'] = None
+            st.session_state['last_loaded_df'] = None
+            st.rerun()
+
+    # --- RUTEO DE VISTAS (Lógica de la aplicación) ---
+    current_view = st.session_state['current_view']
+    selected_id = st.session_state.get('selected_estudio_id')
+    
+    if current_view == 'home':
+        home_page()
+    elif current_view == 'registro':
+        registro_page() # No debería ocurrir si está logueado
+    elif current_view == 'crear_estudio':
+        crear_estudio_page()
+    elif current_view == 'ver_detalle':
+        if selected_id:
+            ver_detalle_page(selected_id)
+        else:
+            st.warning("Selecciona un estudio para ver los detalles.")
+            st.session_state['current_view'] = 'home'
+    elif current_view == 'crear_cuestionario':
+        if selected_id:
+            crear_cuestionario_page()
+        else:
+            st.warning("Selecciona un estudio para definir el cuestionario.")
+            st.session_state['current_view'] = 'home'
+    elif current_view == 'monitorear_avance':
+        monitorear_avance_page()
+    elif current_view == 'analizar_resultados':
+        analizar_resultados_page()
+    elif current_view == 'codificacion_abiertas':
+        codificacion_abiertas_page()
+    elif current_view == 'gestion_paneles':
+        gestion_paneles_page()
+    else:
+        st.session_state['current_view'] = 'home'
+        st.rerun()

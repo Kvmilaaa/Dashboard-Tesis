@@ -1,0 +1,137 @@
+.auth-main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.auth-shell {
+  min-height: calc(100vh - 2rem);
+  display: grid;
+  align-items: center;
+}
+
+.auth-card {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 26px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.auth-layout {
+  display: grid;
+  grid-template-columns: 1.05fr 1fr;
+}
+
+.auth-side {
+  padding: 2rem;
+  background:
+    radial-gradient(circle at 15% 20%, rgba(255, 255, 255, 0.24), transparent 40%),
+    linear-gradient(165deg, #0f7b6c 0%, #125fb4 70%);
+  color: #fff;
+}
+
+.auth-eyebrow {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.75rem;
+  opacity: 0.9;
+}
+
+.auth-side h1 {
+  margin: 0.7rem 0 0;
+  font-family: var(--font-title), sans-serif;
+  font-size: clamp(1.6rem, 3vw, 2.4rem);
+}
+
+.auth-description {
+  margin-top: 0.8rem;
+  line-height: 1.55;
+  opacity: 0.95;
+}
+
+.auth-benefits {
+  margin: 1.2rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.auth-benefits li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  line-height: 1.35;
+}
+
+.auth-benefits li::before {
+  content: "";
+  margin-top: 0.34rem;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ffd978;
+  flex-shrink: 0;
+}
+
+.auth-form-wrap {
+  padding: 2rem;
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.auth-form-wrap h2 {
+  margin: 0;
+  font-family: var(--font-title), sans-serif;
+  font-size: 1.5rem;
+}
+
+.auth-form-wrap p {
+  margin-top: 0.6rem;
+  color: var(--muted);
+}
+
+.mode-toggle {
+  margin-top: 1rem;
+  display: inline-flex;
+  gap: 0.4rem;
+  background: #f0f5fb;
+  border-radius: 12px;
+  padding: 0.3rem;
+}
+
+.tab-btn {
+  background: transparent;
+  color: var(--muted);
+}
+
+.tab-btn.active {
+  background: #fff;
+  color: var(--ink);
+  border-color: var(--border);
+}
+
+.auth-submit {
+  margin-top: 0.6rem;
+  width: 100%;
+}
+
+.auth-footnote {
+  margin-top: 0.9rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  text-align: center;
+}
+
+@media (max-width: 960px) {
+  .auth-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .auth-side,
+  .auth-form-wrap {
+    padding: 1.3rem;
+  }
+}

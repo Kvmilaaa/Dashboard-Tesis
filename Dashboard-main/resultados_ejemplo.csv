@@ -1,0 +1,21 @@
+ID,Genero,Region,nps_score,Comentario_Abierto,Edad
+1,Mujeres,Metropolitana,10,"Excelente servicio, muy rápida la atención.",35
+2,Hombres,Metropolitana,9,"Lo recomendaría a ojos cerrados.",42
+3,Mujeres,Valparaíso,5,"El precio es demasiado alto.",28
+4,Otro,Metropolitana,7,"Podría mejorar el tiempo de espera.",50
+5,Hombres,Valparaíso,1,"No volvería a comprar, pésima experiencia.",22
+6,Mujeres,Metropolitana,10,"Rápida la atención, lo mejor fue el precio.",31
+7,Hombres,Metropolitana,9,"Absolutamente promotor de la marca.",48
+8,Mujeres,Valparaíso,4,"No entendí la pregunta anterior.",55
+9,Otro,Metropolitana,8,"Todo bien, sin quejas.",25
+10,Hombres,Valparaíso,2,"Me molestó mucho el ruido.",33
+11,Mujeres,Metropolitana,6,"No aplica la pregunta para mi caso.",29
+12,Hombres,Metropolitana,10,"Muy buen servicio.",37
+13,Mujeres,Valparaíso,3,"Pésima atención del personal.",41
+14,Hombres,Metropolitana,7,"Todo ok.",39
+15,Mujeres,Metropolitana,9,"De verdad el mejor servicio que he recibido.",45
+16,Hombres,Valparaíso,0,"No aplica para mi, gracias.",52
+17,Mujeres,Metropolitana,8,"Podría ser más rápido.",26
+18,Hombres,Metropolitana,6,"Estuvo muy lento.",30
+19,Mujeres,Valparaíso,10,"La atención fue excelente, 10 de 10.",34
+20,Hombres,Valparaíso,5,"Pésima atención del personal.",27

@@ -1,0 +1,238 @@
+.status-row,
+.nps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.9rem;
+  margin-top: 1rem;
+}
+
+.metric-card {
+  background: var(--surface-solid);
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  padding: 1rem;
+}
+
+.metric-title {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.metric-value {
+  margin: 0.4rem 0;
+  font-size: 1.6rem;
+  font-family: var(--font-title), sans-serif;
+}
+
+.metric-helper {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-link,
+.tab-btn {
+  border-radius: 10px;
+  border: 1px solid transparent;
+  padding: 0.55rem 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), #2a9687);
+  color: #fff;
+}
+
+.btn-primary:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.btn-secondary {
+  background: #fff;
+  color: var(--ink);
+  border-color: var(--border);
+}
+
+.btn-link {
+  background: rgba(15, 123, 108, 0.1);
+  color: var(--accent);
+  border-color: rgba(15, 123, 108, 0.22);
+}
+
+.table-wrap {
+  margin-top: 1rem;
+  overflow-x: auto;
+}
+
+.studies-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.studies-table th,
+.studies-table td {
+  padding: 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.studies-table thead th {
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  background: #f6faff;
+}
+
+.state-chip {
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid rgba(18, 95, 180, 0.35);
+  background: rgba(18, 95, 180, 0.1);
+  color: var(--accent-3);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.form-grid {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.8rem;
+}
+
+.form-grid.two-cols {
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+}
+
+.form-grid label {
+  display: grid;
+  gap: 0.35rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.form-grid input,
+.form-grid select,
+.form-grid textarea {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem 0.75rem;
+  font: inherit;
+  background: #fff;
+}
+
+.form-grid input:focus,
+.form-grid select:focus,
+.form-grid textarea:focus {
+  outline: 2px solid rgba(15, 123, 108, 0.18);
+  border-color: rgba(15, 123, 108, 0.4);
+}
+
+.full-row {
+  grid-column: 1 / -1;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
+
+.monitor-grid {
+  margin-top: 0.8rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 0.8rem;
+}
+
+.monitor-card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1rem;
+}
+
+.monitor-card h3 {
+  margin-top: 0;
+}
+
+.full-width {
+  grid-column: 1 / -1;
+}
+
+.progress-row {
+  margin-top: 0.8rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.progress-track {
+  margin-top: 0.4rem;
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: #e7edf5;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-3));
+}
+
+.json-box {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 0.8rem;
+  border-radius: 10px;
+  background: #18212b;
+  color: #d6e1ee;
+}
+
+.error-box,
+.notice-box,
+.success-box {
+  border-radius: 10px;
+  padding: 0.65rem 0.8rem;
+  margin: 0.4rem 0 0;
+}
+
+.error-box {
+  border: 1px solid rgba(199, 70, 70, 0.3);
+  background: rgba(199, 70, 70, 0.12);
+  color: #6b1717;
+}
+
+.notice-box,
+.success-box {
+  border: 1px solid rgba(15, 123, 108, 0.25);
+  background: rgba(15, 123, 108, 0.12);
+  color: var(--success);
+}
+
+.muted-note {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+@media (max-width: 900px) {
+  .form-grid.two-cols,
+  .monitor-grid {
+    grid-template-columns: 1fr;
+  }
+}

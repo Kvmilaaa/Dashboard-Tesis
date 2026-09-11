@@ -1545,65 +1545,186 @@ def analizar_resultados_page():
         st.write("Compara si la media de una variable numérica es significativamente diferente entre dos grupos de una variable categórica.")
         
         # 1. Selección de Variables
-        preguntas_num = [q for q in preguntas if q.get('tipo', q.get('tipo_pregunta', '')) in ['NPS', 'Calculada/Auxiliar'] or 'score' in q.get('columna', q.get('columna_csv', ''))]
-        preguntas_cat = [q for q in preguntas if q.get('tipo', q.get('tipo_pregunta', '')) in ['Single (Opción Única)', 'Demográfico']]
+        preguntas_num = [
+            q for q in preguntas
+            if q.get('tipo', q.get('tipo_pregunta', '')) in ['NPS', 'Calculada/Auxiliar']
+            or 'score' in q.get('columna', q.get('columna_csv', ''))
+        ]
 
-        opciones_num = {q.get('texto', q.get('texto_pregunta', q.get('columna', 'Sin Título'))): q.get('columna', q.get('columna_csv', '')) for q in preguntas_num}
-        opciones_cat = {q.get('texto', q.get('texto_pregunta', q.get('columna', 'Sin Título'))): q.get('columna', q.get('columna_csv', '')) for q in preguntas_cat}
+        preguntas_cat = [
+            q for q in preguntas
+            if q.get('tipo', q.get('tipo_pregunta', '')) in ['Single (Opción Única)', 'Demográfico']
+        ]
+
+        opciones_num = {
+            q['pregunta_texto']: q['columna_csv']
+            for q in preguntas_num
+        }
+
+        opciones_cat = {
+            q['pregunta_texto']: q['columna_csv']
+            for q in preguntas_cat
+        }
+
         if not opciones_num or not opciones_cat:
             st.warning("Necesitas variables numéricas y categóricas binarias (2 categorías) para realizar el T-Test.")
             return
-            
+
         col_num_sel, col_cat_sel = st.columns(2)
+
         with col_num_sel:
-            col_num_text = st.selectbox("Variable Numérica (Dependiente)", list(opciones_num.keys()))
+            col_num_text = st.selectbox(
+                "Variable Numérica (Dependiente)",
+                list(opciones_num.keys())
+            )
             col_num = opciones_num[col_num_text]
+
         with col_cat_sel:
-            col_cat_text = st.selectbox("Variable Categórica (Independiente - Binaria)", list(opciones_cat.keys()))
+            col_cat_text = st.selectbox(
+                "Variable Categórica (Independiente - Binaria)",
+                list(opciones_cat.keys())
+            )
             col_cat = opciones_cat[col_cat_text]
             
-        # 2. Ejecutar T-Test
+               # 2. Ejecutar T-Test
         try:
-            categorias = df_respuestas[col_cat].dropna().unique()
-            if len(categorias) != 2:
-                st.error(f"La variable categórica '{col_cat_text}' debe tener exactamente dos grupos para el T-Test. Se encontraron {len(categorias)}.")
+            categorias = df_respuestas[col_cat].dropna().unique().tolist()
+
+            if len(categorias) < 2:
+                st.error(
+                    f"La variable categórica '{col_cat_text}' debe contener al menos dos grupos para realizar el T-Test."
+                )
                 return
-            
-            grupo1, grupo2 = categorias[0], categorias[1]
-            
-            # Limpiar datos numéricos y categóricos
-            df_test = df_respuestas[[col_num, col_cat]].dropna().copy()
-            df_test[col_num] = pd.to_numeric(df_test[col_num], errors='coerce')
-            df_test = df_test.dropna()
-            
+
+            # Si existen más de dos categorías, permitir seleccionar qué dos grupos comparar
+            if len(categorias) > 2:
+                st.info(
+                    f"La variable '{col_cat_text}' contiene {len(categorias)} categorías. "
+                    "Selecciona los dos grupos que deseas comparar."
+                )
+
+                col_g1, col_g2 = st.columns(2)
+
+                with col_g1:
+                    grupo1 = st.selectbox(
+                        "Grupo 1",
+                        categorias,
+                        key="ttest_grupo1"
+                    )
+
+                with col_g2:
+                    opciones_grupo2 = [g for g in categorias if g != grupo1]
+                    grupo2 = st.selectbox(
+                        "Grupo 2",
+                        opciones_grupo2,
+                        key="ttest_grupo2"
+                    )
+            else:
+                grupo1, grupo2 = categorias[0], categorias[1]
+
+            # Limpiar datos y eliminar valores faltantes
+            df_test = df_respuestas[[col_num, col_cat]].copy()
+            df_test[col_num] = pd.to_numeric(df_test[col_num], errors="coerce")
+            df_test = df_test.dropna(subset=[col_num, col_cat])
+
+            # Seleccionar únicamente los dos grupos elegidos
             data_g1 = df_test[df_test[col_cat] == grupo1][col_num]
             data_g2 = df_test[df_test[col_cat] == grupo2][col_num]
-            
+
             if len(data_g1) < 2 or len(data_g2) < 2:
-                st.warning("No hay suficientes datos válidos en al menos uno de los grupos para realizar el T-Test.")
+                st.warning(
+                    "No hay suficientes datos válidos en al menos uno de los grupos "
+                    "para realizar la prueba t de Welch."
+                )
                 return
-            
-            # Realizar el T-Test de Student (asumiendo varianzas desiguales)
-            t_stat, p_value = stats.ttest_ind(data_g1, data_g2, equal_var=False)
-            
+
+            # Prueba t de Welch para muestras independientes
+            t_stat, p_value = stats.ttest_ind(
+                data_g1,
+                data_g2,
+                equal_var=False
+            )
+
+            # Cálculo de grados de libertad de Welch-Satterthwaite
+            n1 = len(data_g1)
+            n2 = len(data_g2)
+
+            var1 = data_g1.var(ddof=1)
+            var2 = data_g2.var(ddof=1)
+
+            numerador = (var1 / n1 + var2 / n2) ** 2
+            denominador = (
+                ((var1 / n1) ** 2) / (n1 - 1)
+                + ((var2 / n2) ** 2) / (n2 - 1)
+            )
+
+            grados_libertad = (
+                numerador / denominador
+                if denominador != 0
+                else np.nan
+            )
+
         except Exception as e:
             st.error(f"Error al ejecutar el Test de Hipótesis: {e}")
             return
-            
+
         st.markdown("---")
-        st.subheader("Resultados del T-Test (Asumiendo Varianza Desigual)")
-        
-        col_t, col_p, col_m1, col_m2 = st.columns(4)
-        with col_t: st.metric("Estadístico T", f"{t_stat:.3f}")
-        with col_p: st.metric("Valor P", f"{p_value:.3e}")
-        with col_m1: st.metric(f"Media de {grupo1}", f"{data_g1.mean():.2f} (N={len(data_g1)})")
-        with col_m2: st.metric(f"Media de {grupo2}", f"{data_g2.mean():.2f} (N={len(data_g2)})")
-        
+        st.subheader("Resultados de la prueba t de Welch")
+
+        # Hipótesis
+        st.markdown(
+            f"""
+            **Hipótesis del contraste**
+
+            **H0:** La media de **{col_num_text}** es igual entre **{grupo1}** y **{grupo2}**.
+
+            **H1:** La media de **{col_num_text}** es diferente entre **{grupo1}** y **{grupo2}**.
+            """
+        )
+
+        col_t, col_p, col_gl = st.columns(3)
+
+        with col_t:
+            st.metric("Estadístico t", f"{t_stat:.3f}")
+
+        with col_p:
+            st.metric("Valor p", f"{p_value:.4f}")
+
+        with col_gl:
+            st.metric("Grados de libertad", f"{grados_libertad:.2f}")
+
+        col_m1, col_m2 = st.columns(2)
+
+        with col_m1:
+            st.metric(
+                f"Media de {grupo1}",
+                f"{data_g1.mean():.2f}",
+                delta=f"N={n1}"
+            )
+
+        with col_m2:
+            st.metric(
+                f"Media de {grupo2}",
+                f"{data_g2.mean():.2f}",
+                delta=f"N={n2}"
+            )
+
         alpha = 0.05
+
+        st.write(f"**Nivel de significancia:** α = {alpha}")
+
         if p_value < alpha:
-            st.success(f"Diferencia Significativa: Se rechaza la hipótesis nula (p < {alpha}). La media de {col_num_text} es significativamente diferente entre {grupo1} y {grupo2}.")
+            st.success(
+                f"Se rechaza H0 (p = {p_value:.4f} < {alpha}). "
+                f"Existe evidencia estadística de una diferencia entre las medias "
+                f"de {grupo1} y {grupo2} para la variable '{col_num_text}'."
+            )
         else:
-            st.info(f"No hay Diferencia Significativa: No se puede rechazar la hipótesis nula (p > {alpha}).")
+            st.info(
+                f"No se rechaza H0 (p = {p_value:.4f} ≥ {alpha}). "
+                f"No existe evidencia estadística suficiente para afirmar que las medias "
+                f"de {grupo1} y {grupo2} sean diferentes para la variable '{col_num_text}'."
+            )
 
 
     with tab4:

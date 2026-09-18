@@ -42,6 +42,9 @@ if 'current_view' not in st.session_state:
     st.session_state['current_view'] = 'home'
 if 'username' not in st.session_state:
     st.session_state['username'] = None
+    if 'rol' not in st.session_state:
+     st.session_state['rol'] = None
+     rol_actual = st.session_state.get('rol') or 'Cliente'
 # Inicializar el estado del tema
 if 'theme' not in st.session_state:
     st.session_state['theme'] = 'Dark' # Tema inicial por defecto
@@ -61,19 +64,48 @@ if 'selected_df' not in st.session_state:
 DB_NAME = 'estudios_db.db'
 
 def init_db():
-    """Inicializa la base de datos de usuarios, estudios y paneles."""
+    """Inicializa la base de datos de usuarios, estudios, cuestionarios y paneles."""
+
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+
+    # -------------------------
     # Tabla de Usuarios
+    # -------------------------
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password_hash TEXT,
             nombre_completo TEXT,
-            correo TEXT
+            correo TEXT,
+            rol TEXT NOT NULL DEFAULT 'Cliente'
         )
     ''')
+
+    # Migración para bases de datos antiguas que aún no tengan la columna rol
+    try:
+        c.execute(
+            "ALTER TABLE users ADD COLUMN rol TEXT NOT NULL DEFAULT 'Cliente'"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    # -------------------------
+    # Solicitudes de recuperación de contraseña
+    # -------------------------
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS password_reset_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            correo TEXT NOT NULL,
+            fecha_solicitud TEXT DEFAULT CURRENT_TIMESTAMP,
+            estado TEXT NOT NULL DEFAULT 'Pendiente',
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+    ''')
+    # -------------------------
     # Tabla de Estudios
+    # -------------------------
     c.execute('''
         CREATE TABLE IF NOT EXISTS estudios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,12 +116,14 @@ def init_db():
             muestra INTEGER,
             tecnica TEXT,
             estado TEXT,
-            cuotas_json TEXT, 
+            cuotas_json TEXT,
             link_cuestionario TEXT
         )
     ''')
-    
+
+    # -------------------------
     # Tabla de Cuestionarios
+    # -------------------------
     c.execute('''
         CREATE TABLE IF NOT EXISTS cuestionarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,8 +134,10 @@ def init_db():
             FOREIGN KEY (estudio_id) REFERENCES estudios (id)
         )
     ''')
-        
-    # Tabla de Encuestados/Paneles
+
+    # -------------------------
+    # Tabla de Paneles
+    # -------------------------
     c.execute('''
         CREATE TABLE IF NOT EXISTS paneles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,13 +149,15 @@ def init_db():
             fecha_registro TEXT
         )
     ''')
-    
-    # MODIFICACIÓN DE ESQUEMA: Añadir link_cuestionario si no existe 
+
+    # Migración para bases antiguas que aún no tengan link_cuestionario
     try:
-        c.execute("ALTER TABLE estudios ADD COLUMN link_cuestionario TEXT")
+        c.execute(
+            "ALTER TABLE estudios ADD COLUMN link_cuestionario TEXT"
+        )
     except sqlite3.OperationalError:
         pass
-        
+
     conn.commit()
     conn.close()
 
@@ -130,31 +168,96 @@ def get_db_connection():
     return sqlite3.connect(DB_NAME)
 
 # Funciones de Usuarios (Creación y Verificación)
-def create_user(username, password, nombre, correo):
-    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+def create_user(username, password, nombre, correo, rol="Cliente"):
+    hashed_password = bcrypt.hashpw(
+        password.encode('utf-8'),
+        bcrypt.gensalt()
+    )
+
     conn = get_db_connection()
     c = conn.cursor()
+
     try:
-        c.execute("INSERT INTO users (username, password_hash, nombre_completo, correo) VALUES (?, ?, ?, ?)",
-                  (username, hashed_password.decode('utf-8'), nombre, correo))
+        c.execute(
+            """
+            INSERT INTO users
+            (username, password_hash, nombre_completo, correo, rol)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                username,
+                hashed_password.decode('utf-8'),
+                nombre,
+                correo,
+                rol
+            )
+        )
+
         conn.commit()
         return True
+
     except sqlite3.IntegrityError:
         return False
+
+    finally:
+        conn.close()
+def get_all_users():
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT username, nombre_completo, correo, rol
+        FROM users
+        ORDER BY username
+    """)
+
+    usuarios = c.fetchall()
+    conn.close()
+
+    return usuarios
+
+
+def update_user_role(username, nuevo_rol):
+    if nuevo_rol not in ["Cliente", "Analista", "Administrador"]:
+        return False
+
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    try:
+        c.execute(
+            "UPDATE users SET rol = ? WHERE username = ?",
+            (nuevo_rol, username)
+        )
+        conn.commit()
+        return True
+
+    except Exception:
+        return False
+
     finally:
         conn.close()
 
 def verify_user(username, password):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+
+    c.execute(
+        "SELECT password_hash, rol FROM users WHERE username = ?",
+        (username,)
+    )
+
     result = c.fetchone()
     conn.close()
-    
+
     if result:
         password_hash = result[0].encode('utf-8')
-        return bcrypt.checkpw(password.encode('utf-8'), password_hash)
-    return False
+        rol = result[1]
+
+        if bcrypt.checkpw(password.encode('utf-8'), password_hash):
+            return rol
+
+    return None
 
 # Funciones de Estudios (Guardar, Cargar y Eliminar)
 
@@ -174,6 +277,28 @@ def delete_estudio(estudio_id):
     """Elimina un estudio y sus preguntas asociadas."""
     conn = get_db_connection()
     c = conn.cursor()
+
+    try:
+        # Primero elimina las preguntas asociadas al estudio
+        c.execute("DELETE FROM cuestionarios WHERE estudio_id = ?", (estudio_id,))
+
+        # Luego elimina el estudio
+        c.execute("DELETE FROM estudios WHERE id = ?", (estudio_id,))
+
+        conn.commit()
+
+        # Limpia la caché para actualizar la lista de estudios
+        st.cache_data.clear()
+
+        return True
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error al eliminar estudio: {e}")
+        return False
+
+    finally:
+        conn.close()
 
        
 @st.cache_data
@@ -293,7 +418,7 @@ def calcular_nps_y_avance(df_respuestas):
         
     df_nps['nps_categoria'] = np.select(
         [df_nps['nps_score'] >= 9, df_nps['nps_score'] >= 7],
-        ['Promotor', 'Neutro'],
+        ['Promotor', 'Pasivo'],
         default='Detractor'
     )
     
@@ -306,13 +431,10 @@ def calcular_nps_y_avance(df_respuestas):
     
     nps_score = percent_promotores - percent_detractores
     
-    # Añadir la columna de categoría al DF original para uso posterior si es necesario
-    if 'nps_categoria_new' in df_respuestas.columns:
-        df_respuestas['nps_categoria'] = df_respuestas['nps_categoria_new'].fillna('No Aplica')
-    else:
-        df_respuestas['nps_categoria'] = 'No Aplica'
-        
-    df_respuestas = df_respuestas.drop(columns=['nps_categoria_new'], errors='ignore')
+    # Añadir la categoría NPS calculada al DataFrame original
+    df_respuestas['nps_categoria'] = 'No Aplica'
+
+    df_respuestas.loc[df_nps.index, 'nps_categoria'] = df_nps['nps_categoria'] 
 
     return total_validas, nps_score, percent_promotores, percent_detractores, df_respuestas
     
@@ -556,15 +678,17 @@ def login_page():
             password = st.text_input("Contraseña", type="password")
             submit_button = st.form_submit_button("Ingresar", type="primary")
 
-            if submit_button:
-                if verify_user(username, password):
-                    st.session_state['logged_in'] = True
-                    st.session_state['current_view'] = 'home'
-                    st.session_state['username'] = username
-                    st.rerun() 
-                else:
-                    st.error("Usuario o contraseña incorrectos.")
-        
+        if submit_button:
+            rol = verify_user(username, password)
+
+            if rol:
+                st.session_state['logged_in'] = True
+                st.session_state['current_view'] = 'home'
+                st.session_state['username'] = username
+                st.session_state['rol'] = rol
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
         st.markdown("---")
         
         # Botón para ir al Registro
@@ -579,52 +703,99 @@ def login_page():
             st.rerun()
 
 def reset_password_page():
-    """Muestra la página para restablecer la contraseña."""
-    st.title("🔒 Restablecer Contraseña")
-    st.markdown("Ingresa tu **nombre de usuario** y la **nueva contraseña** que deseas utilizar.")
+    """Permite solicitar de forma segura la recuperación de contraseña."""
     
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        with st.form("reset_password_form"):
-            username_reset = st.text_input("Nombre de Usuario", key="username_reset")
-            new_password = st.text_input("Nueva Contraseña", type="password", key="new_password_reset")
-            confirm_password = st.text_input("Confirmar Nueva Contraseña", type="password", key="confirm_password_reset")
-            
-            reset_button = st.form_submit_button("Actualizar Contraseña", type="primary")
-            
-            if reset_button:
-                if not username_reset or not new_password or not confirm_password:
-                    st.error("Todos los campos son obligatorios.")
-                elif new_password != confirm_password:
-                    st.error("Las contraseñas no coinciden.")
-                else:
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    
-                    # 1. Verificar si el usuario existe
-                    c.execute("SELECT username FROM users WHERE username=?", (username_reset,))
-                    user_exists = c.fetchone()
-                    
-                    if user_exists:
-                        # 2. Hashear la nueva contraseña y actualizar
-                        hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-                        # El campo es 'password_hash'
-                        c.execute("UPDATE users SET password_hash=? WHERE username=?", (hashed_password, username_reset))
-                        conn.commit()
-                        
-                        st.success("✅ Contraseña actualizada con éxito. Ahora puedes iniciar sesión.")
-                        st.session_state['current_view'] = 'login' # Redirigir a login
-                        st.rerun()
+    st.title("🔐 Recuperación de Contraseña")
+
+    st.info(
+        "Por razones de seguridad, la contraseña no puede restablecerse "
+        "directamente desde esta pantalla."
+    )
+
+    st.write(
+        "Ingresa tu nombre de usuario y el correo registrado en tu cuenta. "
+        "Si los datos coinciden, se enviará una solicitud al Administrador."
+    )
+
+    with st.form("password_reset_request_form"):
+        username_reset = st.text_input("Nombre de Usuario")
+        correo_reset = st.text_input("Correo registrado")
+
+        enviar_solicitud = st.form_submit_button(
+            "📨 Enviar solicitud de recuperación"
+        )
+
+        if enviar_solicitud:
+            username_reset = username_reset.strip()
+            correo_reset = correo_reset.strip()
+
+            if not username_reset or not correo_reset:
+                st.error("❌ Debes completar ambos campos.")
+
+            else:
+                conn = get_db_connection()
+                c = conn.cursor()
+
+                # Verificar que usuario y correo correspondan a la misma cuenta
+                c.execute(
+                    """
+                    SELECT username
+                    FROM users
+                    WHERE username = ? AND correo = ?
+                    """,
+                    (username_reset, correo_reset)
+                )
+
+                usuario = c.fetchone()
+
+                if usuario:
+                    # Revisar si ya existe una solicitud pendiente
+                    c.execute(
+                        """
+                        SELECT id
+                        FROM password_reset_requests
+                        WHERE username = ? AND estado = 'Pendiente'
+                        """,
+                        (username_reset,)
+                    )
+
+                    solicitud_existente = c.fetchone()
+
+                    if solicitud_existente:
+                        st.warning(
+                            "⚠️ Ya existe una solicitud de recuperación "
+                            "pendiente para esta cuenta."
+                        )
+
                     else:
-                        st.error("❌ Usuario no encontrado.")
-                    
-                    conn.close()
+                        c.execute(
+                            """
+                            INSERT INTO password_reset_requests
+                            (username, correo, estado)
+                            VALUES (?, ?, 'Pendiente')
+                            """,
+                            (username_reset, correo_reset)
+                        )
 
-        if st.button("⬅️ Volver al Inicio de Sesión"):
-            st.session_state['current_view'] = 'login'
-            st.rerun()
+                        conn.commit()
 
+                        st.success(
+                            "✅ Solicitud enviada correctamente. "
+                            "Un Administrador deberá verificarla y "
+                            "asignar una contraseña temporal."
+                        )
+
+                else:
+                    st.error(
+                        "❌ El usuario y el correo ingresados no coinciden "
+                        "con una cuenta registrada."
+                    )
+
+                conn.close()
+
+    if st.button("⬅️ Volver al Inicio de Sesión"):
+        st.session_state["current_view"] = "login"
+        st.rerun()
 
 def registro_page():
     """Muestra la página de Registro. Uso de st.header unificado."""
@@ -647,7 +818,7 @@ def registro_page():
             correo = st.text_input("Correo Electrónico")
             new_password = st.text_input("Contraseña*", type="password")
             confirm_password = st.text_input("Confirma la Contraseña*", type="password")
-            
+           
             submit_button = st.form_submit_button("Registrarse", type="primary")
 
             if submit_button:
@@ -663,13 +834,155 @@ def registro_page():
                     else:
                         st.error("Error: El nombre de usuario ya existe. Intenta con otro.")
 
+def gestion_usuarios_page():
+    st.header("👥 Gestión de Usuarios")
+
+    rol_actual = st.session_state.get('rol', 'Cliente')
+
+    # Seguridad: solo Administrador puede entrar
+    if rol_actual != 'Administrador':
+        st.error("⛔ No tienes permisos para acceder a esta sección.")
+        return
+
+    usuarios = get_all_users()
+
+    if not usuarios:
+        st.info("No hay usuarios registrados.")
+        return
+
+    st.write("Desde aquí puedes asignar roles a los usuarios registrados.")
+
+    for username, nombre, correo, rol in usuarios:
+        st.markdown("---")
+
+        col1, col2, col3, col4 = st.columns([2, 2, 3, 2])
+
+        with col1:
+            st.write(f"**Usuario:** {username}")
+
+        with col2:
+            st.write(f"**Nombre:** {nombre or '-'}")
+
+        with col3:
+            st.write(f"**Correo:** {correo or '-'}")
+
+        with col4:
+            roles = ["Cliente", "Analista", "Administrador"]
+
+            nuevo_rol = st.selectbox(
+                "Rol",
+                roles,
+                index=roles.index(rol) if rol in roles else 0,
+                key=f"rol_{username}"
+            )
+
+            if nuevo_rol != rol:
+                if st.button("Guardar", key=f"guardar_{username}"):
+                    if update_user_role(username, nuevo_rol):
+                        st.success(f"Rol de {username} actualizado correctamente.")
+                        st.rerun()
+                    else:
+                        st.error("No se pudo actualizar el rol.")
+
+        # --------------------------------------------------
+    # Solicitudes de recuperación de contraseña
+    # --------------------------------------------------
+    st.markdown("---")
+    st.subheader("🔐 Solicitudes de recuperación de contraseña")
+
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute(
+        """
+        SELECT id, username, correo, fecha_solicitud, estado
+        FROM password_reset_requests
+        WHERE estado = 'Pendiente'
+        ORDER BY fecha_solicitud ASC
+        """
+    )
+
+    solicitudes = c.fetchall()
+    conn.close()
+
+    if not solicitudes:
+        st.info("No hay solicitudes de recuperación pendientes.")
+    else:
+        for solicitud_id, username_sol, correo_sol, fecha_sol, estado_sol in solicitudes:
+            st.markdown("---")
+
+            st.write(f"**Usuario:** {username_sol}")
+            st.write(f"**Correo registrado:** {correo_sol}")
+            st.write(f"**Fecha de solicitud:** {fecha_sol}")
+            st.write(f"**Estado:** {estado_sol}")
+
+            nueva_password_temp = st.text_input(
+                "Contraseña temporal",
+                type="password",
+                key=f"temp_pass_{solicitud_id}"
+            )
+
+            confirmar_password_temp = st.text_input(
+                "Confirmar contraseña temporal",
+                type="password",
+                key=f"temp_pass_confirm_{solicitud_id}"
+            )
+
+            if st.button(
+                "✅ Restablecer contraseña",
+                key=f"reset_pass_{solicitud_id}"
+            ):
+                if not nueva_password_temp or not confirmar_password_temp:
+                    st.error("Debes completar ambos campos de contraseña.")
+
+                elif nueva_password_temp != confirmar_password_temp:
+                    st.error("Las contraseñas no coinciden.")
+
+                else:
+                    hashed_password = bcrypt.hashpw(
+                        nueva_password_temp.encode("utf-8"),
+                        bcrypt.gensalt()
+                    ).decode("utf-8")
+
+                    conn = get_db_connection()
+                    c = conn.cursor()
+
+                    c.execute(
+                        """
+                        UPDATE users
+                        SET password_hash = ?
+                        WHERE username = ?
+                        """,
+                        (hashed_password, username_sol)
+                    )
+
+                    c.execute(
+                        """
+                        UPDATE password_reset_requests
+                        SET estado = 'Completada'
+                        WHERE id = ?
+                        """,
+                        (solicitud_id,)
+                    )
+
+                    conn.commit()
+                    conn.close()
+
+                    st.success(
+                        f"Contraseña temporal asignada correctamente a {username_sol}."
+                    )
+
+                    st.rerun()                    
 
 def home_page():
    
     """Muestra la página principal con la tabla de estudios y botones de análisis."""
     st.header("🏠 Gestión de Estudios de Mercado")
 
-    if st.button("➕ Agregar Estudio", type="primary"):
+    rol_actual = st.session_state.get('rol', 'Cliente')
+
+    if rol_actual in ['Analista', 'Administrador']:
+     if st.button("➕ Agregar Estudio", type="primary"):
         st.session_state['current_view'] = 'crear_estudio'
         st.rerun()
 
@@ -712,13 +1025,16 @@ def home_page():
                 st.markdown(f"{row['Monitor']}")
 
         with col_acciones:
-            if st.button("🗑️", key=f"del_{estudio_id}"):
-                if delete_estudio(estudio_id):
-                    st.success("Estudio eliminado")
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    st.error("Error al eliminar")
+         if rol_actual == 'Administrador':
+          if st.button("🗑", key=f"del_{estudio_id}"):
+            if delete_estudio(estudio_id):
+                st.success("Estudio eliminado correctamente")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error("Error al eliminar")
+         else:
+          st.write("-")
 
         # --- Botones de Interacción (Se conservan intactos abajo) ---
         st.markdown("---")
@@ -727,14 +1043,14 @@ def home_page():
         opciones_estudio = df_estudios_db[['ID', 'Título']].copy()
         opciones_estudio['Display'] = opciones_estudio.apply(lambda row: f"ID {row['ID']}: {row['Título']}", axis=1)
         
-        selected_display = st.selectbox(
+    selected_display = st.selectbox(
             "Selecciona un estudio para acceder:",
             opciones_estudio['Display'].tolist(),
             index=None, 
             placeholder="Selecciona un estudio..."
         )
         
-        if selected_display:
+    if selected_display:
             selected_id_str = selected_display.split(":")[0].replace("ID ", "").strip()
             selected_id = int(selected_id_str)
             st.session_state['selected_estudio_id'] = selected_id
@@ -908,37 +1224,52 @@ def ver_detalle_page(estudio_id):
         st.write(f"**Fin de Campo:** {estudio_details['fecha_fin']}")
         st.write(f"**Link Cuestionario:** {estudio_details['link_cuestionario'] or 'N/A'}")
 
-    # Columna 2: Estado y Cuotas
+      # Columna 2: Estado y Cuotas
     with col2:
         st.subheader("Estado y Control")
-        state_options = ['Creación de Estudio', 'Campo Activo', 'Campo Finalizado', 'Cerrado/Analizado']
-        try:
-            initial_index = state_options.index(estudio_details['estado'])
-        except ValueError:
-            initial_index = 0 # default if state not found
-            
-        new_state = st.selectbox(
-            "Cambiar Estado",
-            state_options,
-            index=initial_index
-        )
 
-        if new_state != estudio_details['estado']:
-            if st.button("Actualizar Estado"):
-                if update_estudio_state(estudio_id, new_state):
-                    st.success(f"Estado actualizado a: {new_state}")
-                    st.rerun()
-                else:
-                    st.error("Error al actualizar el estado.")
-        
+        rol_actual = st.session_state.get('rol', 'Cliente')
+
+        # Analista y Administrador pueden cambiar el estado
+        if rol_actual in ['Analista', 'Administrador']:
+            state_options = [
+                'Creación de Estudio',
+                'Campo Activo',
+                'Campo Finalizado',
+                'Cerrado/Analizado'
+            ]
+
+            try:
+                initial_index = state_options.index(estudio_details['estado'])
+            except ValueError:
+                initial_index = 0
+
+            new_state = st.selectbox(
+                "Cambiar Estado",
+                state_options,
+                index=initial_index
+            )
+
+            if new_state != estudio_details['estado']:
+                if st.button("Actualizar Estado"):
+                    if update_estudio_state(estudio_id, new_state):
+                        st.success(f"Estado actualizado a: {new_state}")
+                        st.rerun()
+                    else:
+                        st.error("Error al actualizar el estado.")
+
+        # Cliente solo puede ver el estado
+        else:
+            st.write("**Estado actual:**")
+            st.info(estudio_details['estado'])
+
         st.markdown("---")
         st.subheader("Cuotas Requeridas (JSON)")
+
         try:
             st.json(json.loads(estudio_details['cuotas_json']))
         except (json.JSONDecodeError, TypeError):
             st.warning("El formato de cuotas es inválido.")
-
-
 def crear_cuestionario_page():
     """ Simula la creación de un cuestionario mapeando las columnas del CSV a nombres de preguntas amigables."""
     st.header("📝 Definición del Cuestionario (Mapeo de Preguntas)")
@@ -1043,31 +1374,68 @@ def crear_cuestionario_page():
             st.rerun()
 
 def mostrar_botones_estudio_activo():
-    """Muestra la barra de botones de navegación rápida para el estudio seleccionado."""
+    """Muestra los botones de navegación según el rol del usuario."""
     st.markdown("---")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        # Aquí mantenemos tu botón de volver original
-        if st.button("← Volver a Home", key="nav_home_sup"):
-            st.session_state['current_view'] = 'home'
-            st.rerun()
-    with col2:
-        if st.button("Ver Detalles", key="nav_detalles_sup"):
-            st.session_state['current_view'] = 'ver_estudio'
-            st.rerun()
-    with col3:
-        if st.button("Definir Cuestionario", key="nav_cuestionario_sup"):
-            st.session_state['current_view'] = 'definir_cuestionario'
-            st.rerun()
-    with col4:
-        if st.button("Monitorear Avance", key="nav_avance_sup"):
-            st.session_state['current_view'] = 'monitorear_avance'
-            st.rerun()
-    with col5:
-        if st.button("Analizar Resultados", key="nav_analizar_sup"):
-            st.session_state['current_view'] = 'analizar_resultados'
-            st.rerun()
+
+    rol_actual = st.session_state.get('rol', 'Cliente')
+
+    # ==========================================
+    # CLIENTE
+    # ==========================================
+    if rol_actual == 'Cliente':
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            if st.button("← Volver a Inicio", key="nav_home_sup"):
+                st.session_state['current_view'] = 'home'
+                st.rerun()
+
+        with col2:
+            if st.button("👁️ Ver Detalles", key="nav_detalles_sup"):
+                st.session_state['current_view'] = 'ver_detalle'
+                st.rerun()
+
+        with col3:
+            if st.button("📈 Monitorear Avance", key="nav_avance_sup"):
+                st.session_state['current_view'] = 'monitorear_avance'
+                st.rerun()
+
+        with col4:
+            if st.button("📊 Analizar Resultados", key="nav_analizar_sup"):
+                st.session_state['current_view'] = 'analizar_resultados'
+                st.rerun()
+
+    # ==========================================
+    # ANALISTA Y ADMINISTRADOR
+    # ==========================================
+    else:
+        col1, col2, col3, col4, col5 = st.columns(5)
+
+        with col1:
+            if st.button("← Volver a Inicio", key="nav_home_sup"):
+                st.session_state['current_view'] = 'home'
+                st.rerun()
+
+        with col2:
+            if st.button("👁️ Ver Detalles", key="nav_detalles_sup"):
+                st.session_state['current_view'] = 'ver_detalle'
+                st.rerun()
+
+        with col3:
+            if st.button("📝 Definir Cuestionario", key="nav_cuestionario_sup"):
+                st.session_state['current_view'] = 'crear_cuestionario'
+                st.rerun()
+
+        with col4:
+            if st.button("📈 Monitorear Avance", key="nav_avance_sup"):
+                st.session_state['current_view'] = 'monitorear_avance'
+                st.rerun()
+
+        with col5:
+            if st.button("📊 Analizar Resultados", key="nav_analizar_sup"):
+                st.session_state['current_view'] = 'analizar_resultados'
+                st.rerun()
+
     st.markdown("---")
 def monitorear_avance_page():
     """Página de monitoreo de avance de campo y cumplimiento de cuotas."""
@@ -1397,46 +1765,86 @@ def analizar_resultados_page():
     df_respuestas = df_respuestas.rename(columns={'nps_categoria_new': 'nps_categoria'})
     st.session_state['last_loaded_df'] = df_respuestas # Actualizar DF en sesión con categoría NPS
 
-    tab1, tab2, tab3, tab4 = st.tabs(["NPS Score", "Tabulaciones Cruzadas", "Test de Hipótesis", "Descarga de Base"])
+    rol_actual = st.session_state.get('rol', 'Cliente')
+
+    if rol_actual in ['Analista', 'Administrador']:
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "NPS Score",
+            "Tabulaciones Cruzadas",
+            "Test de Hipótesis",
+            "Descarga de Base"
+        ])
+    else:
+        tab1, tab2, tab3 = st.tabs([
+            "NPS Score",
+            "Tabulaciones Cruzadas",
+            "Test de Hipótesis"
+        ])
+        tab4 = None 
     
     with tab1:
-        st.subheader("Net Promoter Score (NPS)")
-        col_nps, col_pro, col_det, col_neut = st.columns(4)
-        
-        with col_nps:
-            st.metric(label="NPS Score", value=f"{nps_score:.1f}", delta=f"N={total_validas:,}")
-        with col_pro:
-            st.metric(label="% Promotores (9-10)", value=f"{percent_promotores:.1f}%")
-        with col_det:
-            st.metric(label="% Detractores (0-6)", value=f"{percent_detractores:.1f}%")
-        with col_neut:
-            neutros = 100 - percent_promotores - percent_detractores
-            st.metric(label="% Neutros (7-8)", value=f"{neutros:.1f}%")
-            
-        # Gráfico de Categorías NPS
-        if total_validas > 0:
-            df_nps_counts = df_respuestas['nps_categoria'].value_counts().reset_index()
-            df_nps_counts.columns = ['Categoría', 'N']
-            
-            # Asegurar que todas las categorías estén presentes para el gráfico, incluyendo 'No Aplica'
-            categorias_nps = ['Promotor', 'Neutro', 'Detractor', 'No Aplica']
-            for cat in categorias_nps:
-                if cat not in df_nps_counts['Categoría'].values:
-                    df_nps_counts.loc[len(df_nps_counts)] = {'Categoría': cat, 'N': 0}
+     st.subheader("Net Promoter Score (NPS)")
+    col_nps, col_pro, col_det, col_pas = st.columns(4)
 
-            color_map = {'Promotor': '#4CAF50', 'Neutro': '#FFC107', 'Detractor': '#F44336', 'No Aplica': '#9E9E9E'}
-            
-            fig_nps = px.bar(
-                df_nps_counts,
-                x='Categoría',
-                y='N',
-                title='Distribución de Categorías NPS',
-                text_auto='.1f',
-                color='Categoría',
-                color_discrete_map=color_map,
-                labels={'N': 'Frecuencia (N)'}
-            )
-            st.plotly_chart(fig_nps, use_container_width=True)
+    with col_nps:
+        st.metric(
+            label="NPS Score",
+            value=f"{nps_score:.1f}"
+        )
+
+    with col_pro:
+        st.metric(
+            label="% Promotores (9-10)",
+            value=f"{percent_promotores:.1f}%"
+        )
+
+    with col_det:
+        st.metric(
+            label="% Detractores (0-6)",
+            value=f"{percent_detractores:.1f}%"
+        )
+
+    with col_pas:
+        pasivos = 100 - percent_promotores - percent_detractores
+        st.metric(
+            label="% Pasivos (7-8)",
+            value=f"{pasivos:.1f}%"
+        )
+
+    # Gráfico de Categorías NPS
+    if total_validas > 0:
+        df_nps_counts = df_respuestas['nps_categoria'].value_counts().reset_index()
+        df_nps_counts.columns = ['Categoría', 'N']
+
+        # Asegurar que todas las categorías estén presentes para el gráfico
+        categorias_nps = ['Promotor', 'Pasivo', 'Detractor', 'No Aplica']
+
+        for cat in categorias_nps:
+            if cat not in df_nps_counts['Categoría'].values:
+                df_nps_counts.loc[len(df_nps_counts)] = {
+                    'Categoría': cat,
+                    'N': 0
+                }
+
+        color_map = {
+            'Promotor': '#4CAF50',
+            'Pasivo': '#FFC107',
+            'Detractor': '#F44336',
+            'No Aplica': '#9E9E9E'
+        }
+
+        fig_nps = px.bar(
+            df_nps_counts,
+            x='Categoría',
+            y='N',
+            title='Distribución de Categorías NPS',
+            text_auto='.1f',
+            color='Categoría',
+            color_discrete_map=color_map,
+            labels={'N': 'Frecuencia (N)'}
+        )
+
+        st.plotly_chart(fig_nps, use_container_width=True)
 
         st.markdown("---")
         st.markdown("---")
@@ -1544,7 +1952,7 @@ def analizar_resultados_page():
         st.subheader("Test de Hipótesis (T-Test de Medias)")
         st.write("Compara si la media de una variable numérica es significativamente diferente entre dos grupos de una variable categórica.")
         
-        # 1. Selección de Variables
+                # 1. Selección de Variables
         preguntas_num = [
             q for q in preguntas
             if q.get('tipo', q.get('tipo_pregunta', '')) in ['NPS', 'Calculada/Auxiliar']
@@ -1727,7 +2135,8 @@ def analizar_resultados_page():
             )
 
 
-    with tab4:
+    if tab4 is not None:
+     with tab4:
         st.subheader("📥 Descarga de Base de Campo Estructurada")
         st.write("Genera un archivo CSV o Excel de la base de datos cargada.")
 
@@ -1735,37 +2144,59 @@ def analizar_resultados_page():
         df_download = st.session_state.get('last_loaded_df', df_respuestas)
         estudio_id_val = st.session_state.get('selected_estudio_id', 'estudio')
 
-        if df_download is not None and not df_download.empty:
-            col_dl1, col_dl2 = st.columns(2)
-            
-            with col_dl1:
-                csv_file = convert_df_to_csv(df_download)
-                st.download_button(
-                    label="📄 Descargar Base de Datos (CSV)",
-                    data=csv_file,
-                    file_name=f"base_datos_{estudio_id_val}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime='text/csv',
-                    use_container_width=True
+        rol_actual = st.session_state.get('rol', 'Cliente')
+
+        # Solo Analista y Administrador pueden descargar la base completa
+        if rol_actual in ['Analista', 'Administrador']:
+
+            if df_download is not None and not df_download.empty:
+                col_dl1, col_dl2 = st.columns(2)
+
+                with col_dl1:
+                    csv_file = convert_df_to_csv(df_download)
+
+                    st.download_button(
+                        label="📄 Descargar Base de Datos (CSV)",
+                        data=csv_file,
+                        file_name=f"base_datos_{estudio_id_val}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                with col_dl2:
+                    import io
+
+                    buffer = io.BytesIO()
+
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        df_download.to_excel(
+                            writer,
+                            index=False,
+                            sheet_name='Respuestas'
+                        )
+
+                    buffer.seek(0)
+
+                    st.download_button(
+                        label="📊 Descargar Base de Datos (Excel .xlsx)",
+                        data=buffer,
+                        file_name=f"base_datos_{estudio_id_val}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True
+                    )
+
+            else:
+                st.info(
+                    "ℹ️ No hay datos cargados en la sesión para este estudio. "
+                    "Carga un estudio en el Home para habilitar la descarga."
                 )
-                
-            with col_dl2:
-                import io
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df_download.to_excel(writer, index=False, sheet_name='Respuestas')
-                buffer.seek(0)
-                
-                st.download_button(
-                    label="📊 Descargar Base de Datos (Excel .xlsx)",
-                    data=buffer,
-                    file_name=f"base_datos_{estudio_id_val}_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    type="primary",
-                    use_container_width=True
-                )
-                
+
         else:
-            st.info("ℹ️ No hay datos cargados en la sesión para este estudio. Carga un estudio en el Home para habilitar la descarga.")
+            st.info(
+                "🔒 La descarga de la base completa está disponible solo para "
+                "usuarios con rol Analista o Administrador."
+            )
 
 def codificacion_abiertas_page():
     """Página para la codificación de respuestas abiertas (simulada/manual)."""
@@ -1847,29 +2278,157 @@ def codificacion_abiertas_page():
         else:
             st.info("Sin texto limpio para generar la nube de palabras.")
 
-    # 4. Codificación Manual
+        # 4. Codificación Manual
     st.subheader("3. Codificación Manual de Muestra")
+
     if not st.session_state['coding_codes']:
         st.warning("Define códigos en la sección 1 para habilitar la codificación manual.")
+
     elif len(df_respuestas) > 0:
-        # Muestra una pequeña muestra aleatoria (ej: 10 respuestas)
-        muestra_codificar = df_respuestas.sample(min(10, len(df_respuestas))).copy()
-        st.info("Muestra aleatoria de 10 respuestas para codificar:")
-        
+
+        # Crear una muestra fija para evitar que cambie en cada interacción
+        if 'muestra_codificacion' not in st.session_state:
+            st.session_state['muestra_codificacion'] = df_respuestas.sample(
+                min(10, len(df_respuestas)),
+                random_state=42
+            )
+
+        muestra_codificar = st.session_state['muestra_codificacion']
+
+        st.info(
+            f"Muestra de {len(muestra_codificar)} respuestas para codificar:"
+        )
+
+        # Diccionario para conservar las codificaciones realizadas
+        if 'codificaciones_manual' not in st.session_state:
+            st.session_state['codificaciones_manual'] = {}
+
         for index, row in muestra_codificar.iterrows():
-            st.markdown(f"**Respuesta:** {row['Respuesta']}")
-            # Placeholder para la codificación (simulada)
-            selected_codes = st.multiselect(
-                "Asignar Códigos (Simulado)",
-                st.session_state['coding_codes'],
+
+            respuesta = str(row['Respuesta'])
+
+            st.markdown(f"**Respuesta:** {respuesta}")
+
+            seleccion = st.multiselect(
+                "Asignar Códigos",
+                options=st.session_state['coding_codes'],
+                default=st.session_state['codificaciones_manual'].get(
+                    str(index), []
+                ),
                 key=f"code_select_{index}"
             )
-            # En una aplicación real, esto guardaría el código asignado a la base de datos.
+
+            # Guardar la codificación de esta respuesta
+            st.session_state['codificaciones_manual'][str(index)] = seleccion
+
+            if seleccion:
+                st.success(
+                    "Código(s) asignado(s): " + ", ".join(seleccion)
+                )
+
             st.markdown("---")
+
     else:
         st.info("No hay respuestas para codificar.")
+       # 4. Resultados de la Codificación
+    st.subheader("4. Resultados de la Codificación")
 
-# --- AQUÍ PUEDES PEGAR LA NUEVA FUNCIÓN ---
+    # Reunir todos los códigos asignados
+    codigos_asignados = []
+
+    for codigos in st.session_state.get('codificaciones_manual', {}).values():
+        codigos_asignados.extend(codigos)
+
+    if codigos_asignados:
+
+        from collections import Counter
+
+        # Contar códigos asignados
+        conteo = Counter(codigos_asignados)
+        total_codificaciones = sum(conteo.values())
+
+        # Crear tabla de resultados
+        resultados_codificacion = pd.DataFrame({
+            "Código": list(conteo.keys()),
+            "Frecuencia": list(conteo.values())
+        })
+
+        # Calcular porcentaje
+        resultados_codificacion["Porcentaje"] = (
+            resultados_codificacion["Frecuencia"]
+            / total_codificaciones * 100
+        ).round(1)
+
+        resultados_codificacion["Porcentaje"] = (
+            resultados_codificacion["Porcentaje"].astype(str) + " %"
+        )
+
+        # Mostrar tabla
+        st.markdown("#### Resumen de códigos asignados")
+
+        st.dataframe(
+            resultados_codificacion,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Gráfico de distribución
+        st.markdown("#### Distribución de códigos")
+
+        datos_grafico = resultados_codificacion.copy()
+
+        # Ordenar de menor a mayor para gráfico horizontal
+        datos_grafico = datos_grafico.sort_values(
+            by="Frecuencia",
+            ascending=True
+        )
+
+        # Crear gráfico
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+
+        barras = ax.barh(
+            datos_grafico["Código"],
+            datos_grafico["Frecuencia"]
+        )
+
+        # Mostrar frecuencia y porcentaje al final de cada barra
+        for barra, frecuencia, porcentaje in zip(
+            barras,
+            datos_grafico["Frecuencia"],
+            datos_grafico["Porcentaje"]
+        ):
+            ax.text(
+                barra.get_width() + 0.05,
+                barra.get_y() + barra.get_height() / 2,
+                f"{frecuencia} ({porcentaje})",
+                va="center"
+            )
+
+        # Títulos del gráfico
+        ax.set_xlabel("Número de asignaciones")
+        ax.set_ylabel("Código")
+        ax.set_title("Distribución de códigos asignados")
+
+        # Quitar bordes innecesarios
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        plt.tight_layout()
+
+        # Mostrar gráfico en Streamlit
+        st.pyplot(fig)
+
+        # Mensaje final
+        st.success(
+            f"Se han realizado {total_codificaciones} "
+            "asignaciones de códigos en la muestra analizada."
+        )
+
+    else:
+        st.info(
+            "Asigna códigos a las respuestas para generar "
+            "el resumen de resultados."
+        )
 def crear_estudio_page():
     """Muestra el formulario para crear un nuevo estudio."""
     st.header("➕ Creación de Nuevo Estudio de Mercado")
@@ -2025,61 +2584,104 @@ else:
         st.header(f"Hola, {st.session_state['username']}")
         st.markdown("---")
         
-        # Navegación principal
-        if st.button("🏡 Home / Estudios", key="nav_home"):
+                # Navegación principal
+        rol_actual = st.session_state.get('rol', 'Cliente')
+
+        st.caption(f"Rol: {rol_actual}")
+
+        # Disponible para todos los usuarios
+        if st.button("🏠 Home / Estudios", key="nav_home"):
             st.session_state['current_view'] = 'home'
             st.session_state['selected_estudio_id'] = None
             st.session_state['last_loaded_df'] = None
             st.rerun()
-        
-        if st.button("👥 Gestión de Paneles", key="nav_paneles"):
-            st.session_state['current_view'] = 'gestion_paneles'
-            st.rerun()
-            
-        if st.button("💬 Codificación Abiertas", key="nav_codificacion"):
-            st.session_state['current_view'] = 'codificacion_abiertas'
-            st.rerun()
 
-        st.markdown("---")
+        # Solo Analista y Administrador
+        if rol_actual in ['Analista', 'Administrador']:
+
+            if st.button("👥 Gestión de Paneles", key="nav_paneles"):
+                st.session_state['current_view'] = 'gestion_paneles'
+                st.rerun()
+
+            if st.button("💬 Codificación Abiertas", key="nav_codificacion"):
+                st.session_state['current_view'] = 'codificacion_abiertas'
+                st.rerun()
+
+        # Solo Administrador
+        if rol_actual == 'Administrador':
+            if st.button("👥 Gestión de Usuarios", key="nav_usuarios"):
+                st.session_state['current_view'] = 'gestion_usuarios'
+                st.rerun()
+
         # Botón de Logout
         if st.button("🚪 Cerrar Sesión"):
             st.session_state['logged_in'] = False
             st.session_state['current_view'] = 'home'
             st.session_state['username'] = None
+            st.session_state['rol'] = None
             st.session_state['selected_estudio_id'] = None
             st.session_state['last_loaded_df'] = None
             st.rerun()
 
-    # --- RUTEO DE VISTAS (Lógica de la aplicación) ---
+       # --- RUTEO DE VISTAS (Lógica de la aplicación) ---
     current_view = st.session_state['current_view']
     selected_id = st.session_state.get('selected_estudio_id')
-    
+    rol_actual = st.session_state.get('rol', 'Cliente')
+
     if current_view == 'home':
         home_page()
+
     elif current_view == 'registro':
-        registro_page() # No debería ocurrir si está logueado
+        registro_page()
+
     elif current_view == 'crear_estudio':
-        crear_estudio_page()
+        if rol_actual in ['Analista', 'Administrador']:
+            crear_estudio_page()
+        else:
+            st.error("⛔ No tienes permisos para crear estudios.")
+            st.session_state['current_view'] = 'home'
+
     elif current_view == 'ver_detalle':
         if selected_id:
             ver_detalle_page(selected_id)
         else:
             st.warning("Selecciona un estudio para ver los detalles.")
             st.session_state['current_view'] = 'home'
+
     elif current_view == 'crear_cuestionario':
-        if selected_id:
+        if rol_actual not in ['Analista', 'Administrador']:
+            st.error("⛔ No tienes permisos para crear o modificar cuestionarios.")
+            st.session_state['current_view'] = 'home'
+        elif selected_id:
             crear_cuestionario_page()
         else:
             st.warning("Selecciona un estudio para definir el cuestionario.")
             st.session_state['current_view'] = 'home'
+
     elif current_view == 'monitorear_avance':
         monitorear_avance_page()
+
     elif current_view == 'analizar_resultados':
         analizar_resultados_page()
+
     elif current_view == 'codificacion_abiertas':
-        codificacion_abiertas_page()
+        if rol_actual in ['Analista', 'Administrador']:
+            codificacion_abiertas_page()
+        else:
+            st.error("⛔ No tienes permisos para acceder a la codificación de respuestas.")
+            st.session_state['current_view'] = 'home'
+
     elif current_view == 'gestion_paneles':
-        gestion_paneles_page()
+        if rol_actual in ['Analista', 'Administrador']:
+            gestion_paneles_page()
+        else:
+            st.error("⛔ No tienes permisos para gestionar paneles.")
+            st.session_state['current_view'] = 'home'
+
+    elif current_view == 'gestion_usuarios':
+        if rol_actual == 'Administrador':
+            gestion_usuarios_page()
+
     else:
         st.session_state['current_view'] = 'home'
         st.rerun()

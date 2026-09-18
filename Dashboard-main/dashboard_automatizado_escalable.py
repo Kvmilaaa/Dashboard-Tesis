@@ -61,7 +61,12 @@ if 'selected_df' not in st.session_state:
 
 # --- 2. GESTIÓN DE BASE DE DATOS (SQLite) ---
 
-DB_NAME = 'estudios_db.db'
+DB_NAME = '/tmp/estudios_db.db'
+import os
+import shutil
+
+if not os.path.exists(DB_NAME):
+    shutil.copy("estudios_db.db", DB_NAME)
 
 def init_db():
     """Inicializa la base de datos de usuarios, estudios, cuestionarios y paneles."""
